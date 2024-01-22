@@ -1036,3 +1036,1223 @@ void composite_rays(const uint32_t n_alive, const uint32_t n_step, const float T
         kernel_composite_rays<<<div_round_up(n_alive, N_THREAD), N_THREAD>>>(n_alive, n_step, T_thresh, rays_alive.data_ptr<int>(), rays_t.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), weights.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>());
     }));
 }
+
+
+
+template <typename scalar_t>
+__global__ void kernel_composite_rays_ambient(
+    const uint32_t n_alive, 
+    const uint32_t n_step, 
+    const float T_thresh,
+    int* rays_alive, 
+    scalar_t* rays_t, 
+    const scalar_t* __restrict__ sigmas, 
+    const scalar_t* __restrict__ rgbs, 
+    const scalar_t* __restrict__ deltas, 
+    const scalar_t* __restrict__ ambients, 
+    scalar_t* weights_sum, scalar_t* depth, scalar_t* image, scalar_t* ambient_sum
+) {
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= n_alive) return;
+
+    const int index = rays_alive[n]; // ray id
+    
+    // locate 
+    sigmas += n * n_step;
+    rgbs += n * n_step * 3;
+    deltas += n * n_step * 2;
+    ambients += n * n_step;
+    
+    rays_t += index;
+    weights_sum += index;
+    depth += index;
+    image += index * 3;
+    ambient_sum += index;
+
+    scalar_t t = rays_t[0]; // current ray's t
+    
+    scalar_t weight_sum = weights_sum[0];
+    scalar_t d = depth[0];
+    scalar_t r = image[0];
+    scalar_t g = image[1];
+    scalar_t b = image[2];
+    scalar_t a = ambient_sum[0];
+
+    // accumulate 
+    uint32_t step = 0;
+    while (step < n_step) {
+        
+        // ray is terminated if delta == 0
+        if (deltas[0] == 0) break;
+        
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+
+        /* 
+        T_0 = 1; T_i = \prod_{j=0}^{i-1} (1 - alpha_j)
+        w_i = alpha_i * T_i
+        --> 
+        T_i = 1 - \sum_{j=0}^{i-1} w_j
+        */
+        const scalar_t T = 1 - weight_sum;
+        const scalar_t weight = alpha * T;
+        weight_sum += weight;
+
+        t = deltas[1];
+        d += weight * t;
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+        a += ambients[0];
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // ray is terminated if T is too small
+        // use a larger bound to further accelerate inference
+        if (T < T_thresh) break;
+
+        // locate
+        sigmas++;
+        rgbs += 3;
+        deltas += 2;
+        step++;
+        ambients++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // rays_alive = -1 means ray is terminated early.
+    if (step < n_step) {
+        rays_alive[n] = -1;
+    } else {
+        rays_t[0] = t;
+    }
+
+    weights_sum[0] = weight_sum; // this is the thing I needed!
+    depth[0] = d;
+    image[0] = r;
+    image[1] = g;
+    image[2] = b;
+    ambient_sum[0] = a;
+}
+
+
+void composite_rays_ambient(const uint32_t n_alive, const uint32_t n_step, const float T_thresh, at::Tensor rays_alive, at::Tensor rays_t, at::Tensor sigmas, at::Tensor rgbs, at::Tensor deltas, at::Tensor ambients, at::Tensor weights, at::Tensor depth, at::Tensor image, at::Tensor ambient_sum) {
+    static constexpr uint32_t N_THREAD = 128;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    image.scalar_type(), "composite_rays_ambient", ([&] {
+        kernel_composite_rays_ambient<<<div_round_up(n_alive, N_THREAD), N_THREAD>>>(n_alive, n_step, T_thresh, rays_alive.data_ptr<int>(), rays_t.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), ambients.data_ptr<scalar_t>(), weights.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), ambient_sum.data_ptr<scalar_t>());
+    }));
+}
+
+
+
+
+
+
+// -------------------------------- sigma ambient -----------------------------
+
+// sigmas: [M]
+// rgbs: [M, 3]
+// deltas: [M, 2]
+// rays: [N, 3], idx, offset, num_steps
+// weights_sum: [N], final pixel alpha
+// depth: [N,]
+// image: [N, 3]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_train_sigma_forward(
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbs,  
+    const scalar_t * __restrict__ ambient,
+    const scalar_t * __restrict__ deltas,
+    const int * __restrict__ rays,
+    const uint32_t M, const uint32_t N, const float T_thresh, 
+    scalar_t * weights_sum,
+    scalar_t * ambient_sum,
+    scalar_t * depth,
+    scalar_t * image
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t index = rays[n * 3];
+    uint32_t offset = rays[n * 3 + 1];
+    uint32_t num_steps = rays[n * 3 + 2];
+
+    // empty ray, or ray that exceed max step count.
+    if (num_steps == 0 || offset + num_steps > M) {
+        weights_sum[index] = 0;
+        ambient_sum[index] = 0;
+        depth[index] = 0;
+        image[index * 3] = 0;
+        image[index * 3 + 1] = 0;
+        image[index * 3 + 2] = 0;
+        return;
+    }
+
+    sigmas += offset;
+    rgbs += offset * 3;
+    ambient += offset;
+    deltas += offset * 2;
+
+    // accumulate 
+    uint32_t step = 0;
+
+    scalar_t T = 1.0f;
+    scalar_t r = 0, g = 0, b = 0, ws = 0, d = 0, amb = 0;
+
+    while (step < num_steps) {
+
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t weight = alpha * T;
+
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+
+        d += weight * deltas[1];
+        
+        ws += weight;
+
+        amb += weight * ambient[0];
+        
+        T *= 1.0f - alpha;
+
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // locate
+        sigmas++;
+        rgbs += 3;
+        ambient++;
+        deltas += 2;
+
+        step++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // write
+    weights_sum[index] = ws; // weights_sum
+    ambient_sum[index] = amb;
+    depth[index] = d;
+    image[index * 3] = r;
+    image[index * 3 + 1] = g;
+    image[index * 3 + 2] = b;
+}
+
+
+void composite_rays_train_sigma_forward(const at::Tensor sigmas, const at::Tensor rgbs,  const at::Tensor ambient, const at::Tensor deltas, const at::Tensor rays, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor weights_sum, at::Tensor ambient_sum, at::Tensor depth, at::Tensor image) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    sigmas.scalar_type(), "composite_rays_train_sigma_forward", ([&] {
+        kernel_composite_rays_train_sigma_forward<<<div_round_up(N, N_THREAD), N_THREAD>>>(sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), ambient.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), M, N, T_thresh, weights_sum.data_ptr<scalar_t>(), ambient_sum.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>());
+    }));
+}
+
+
+// grad_weights_sum: [N,]
+// grad: [N, 3]
+// sigmas: [M]
+// rgbs: [M, 3]
+// deltas: [M, 2]
+// rays: [N, 3], idx, offset, num_steps
+// weights_sum: [N,], weights_sum here 
+// image: [N, 3]
+// grad_sigmas: [M]
+// grad_rgbs: [M, 3]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_train_sigma_backward(
+    const scalar_t * __restrict__ grad_weights_sum,
+    const scalar_t * __restrict__ grad_ambient_sum,
+    const scalar_t * __restrict__ grad_image,
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbs, 
+    const scalar_t * __restrict__ ambient, 
+    const scalar_t * __restrict__ deltas,
+    const int * __restrict__ rays,
+    const scalar_t * __restrict__ weights_sum,
+    const scalar_t * __restrict__ ambient_sum,
+    const scalar_t * __restrict__ image,
+    const uint32_t M, const uint32_t N, const float T_thresh,
+    scalar_t * grad_sigmas,
+    scalar_t * grad_rgbs,
+    scalar_t * grad_ambient
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t index = rays[n * 3];
+    uint32_t offset = rays[n * 3 + 1];
+    uint32_t num_steps = rays[n * 3 + 2];
+
+    if (num_steps == 0 || offset + num_steps > M) return;
+
+    grad_weights_sum += index;
+    grad_ambient_sum += index;
+    grad_image += index * 3;
+    weights_sum += index;
+    ambient_sum += index;
+    image += index * 3;
+
+    sigmas += offset;
+    rgbs += offset * 3;
+    ambient += offset;
+    deltas += offset * 2;
+
+    grad_sigmas += offset;
+    grad_rgbs += offset * 3;
+    grad_ambient += offset;
+
+    // accumulate 
+    uint32_t step = 0;
+    
+    scalar_t T = 1.0f;
+    const scalar_t r_final = image[0], g_final = image[1], b_final = image[2], ws_final = weights_sum[0], amb_final = ambient_sum[0];
+    scalar_t r = 0, g = 0, b = 0, ws = 0, amb = 0;
+
+    while (step < num_steps) {
+        
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t weight = alpha * T;
+
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+        amb += weight * ambient[0];
+        ws += weight;
+
+        T *= 1.0f - alpha;
+
+        // check https://note.kiui.moe/others/nerf_gradient/ for the gradient calculation.
+        // write grad_rgbs
+        grad_rgbs[0] = grad_image[0] * weight;
+        grad_rgbs[1] = grad_image[1] * weight;
+        grad_rgbs[2] = grad_image[2] * weight;
+        
+        // write grad_ambient
+        grad_ambient[0] = grad_ambient_sum[0] * weight;
+
+        // write grad_sigmas
+        grad_sigmas[0] = deltas[0] * (
+            grad_image[0] * (T * rgbs[0] - (r_final - r)) + 
+            grad_image[1] * (T * rgbs[1] - (g_final - g)) + 
+            grad_image[2] * (T * rgbs[2] - (b_final - b)) +
+            grad_ambient_sum[0] * (T * ambient[0] - (amb_final - amb)) +
+            grad_weights_sum[0] * (1 - ws_final)
+        );
+
+        //printf("[n=%d] num_steps=%d, T=%f, grad_sigmas=%f, r_final=%f, r=%f\n", n, step, T, grad_sigmas[0], r_final, r);
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+    
+        // locate
+        sigmas++;
+        rgbs += 3;
+        ambient++;
+        deltas += 2;
+        grad_sigmas++;
+        grad_rgbs += 3;
+        grad_ambient++;
+
+        step++;
+    }
+}
+
+
+void composite_rays_train_sigma_backward(const at::Tensor grad_weights_sum, const at::Tensor grad_ambient_sum, const at::Tensor grad_image, const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor ambient, const at::Tensor deltas, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor ambient_sum, const at::Tensor image, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor grad_sigmas, at::Tensor grad_rgbs, at::Tensor grad_ambient) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    grad_image.scalar_type(), "composite_rays_train_sigma_backward", ([&] {
+        kernel_composite_rays_train_sigma_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights_sum.data_ptr<scalar_t>(), grad_ambient_sum.data_ptr<scalar_t>(), grad_image.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), ambient.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), ambient_sum.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), M, N, T_thresh, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>(), grad_ambient.data_ptr<scalar_t>());
+    }));
+}
+
+
+////////////////////////////////////////////////////
+/////////////          infernce        /////////////
+////////////////////////////////////////////////////
+
+
+template <typename scalar_t>
+__global__ void kernel_composite_rays_ambient_sigma(
+    const uint32_t n_alive, 
+    const uint32_t n_step, 
+    const float T_thresh,
+    int* rays_alive, 
+    scalar_t* rays_t, 
+    const scalar_t* __restrict__ sigmas, 
+    const scalar_t* __restrict__ rgbs, 
+    const scalar_t* __restrict__ deltas, 
+    const scalar_t* __restrict__ ambients, 
+    scalar_t* weights_sum, scalar_t* depth, scalar_t* image, scalar_t* ambient_sum
+) {
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= n_alive) return;
+
+    const int index = rays_alive[n]; // ray id
+    
+    // locate 
+    sigmas += n * n_step;
+    rgbs += n * n_step * 3;
+    deltas += n * n_step * 2;
+    ambients += n * n_step;
+    
+    rays_t += index;
+    weights_sum += index;
+    depth += index;
+    image += index * 3;
+    ambient_sum += index;
+
+    scalar_t t = rays_t[0]; // current ray's t
+    
+    scalar_t weight_sum = weights_sum[0];
+    scalar_t d = depth[0];
+    scalar_t r = image[0];
+    scalar_t g = image[1];
+    scalar_t b = image[2];
+    scalar_t a = ambient_sum[0];
+
+    // accumulate 
+    uint32_t step = 0;
+    while (step < n_step) {
+        
+        // ray is terminated if delta == 0
+        if (deltas[0] == 0) break;
+        
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+
+        /* 
+        T_0 = 1; T_i = \prod_{j=0}^{i-1} (1 - alpha_j)
+        w_i = alpha_i * T_i
+        --> 
+        T_i = 1 - \sum_{j=0}^{i-1} w_j
+        */
+        const scalar_t T = 1 - weight_sum;
+        const scalar_t weight = alpha * T;
+        weight_sum += weight;
+
+        t = deltas[1];
+        d += weight * t;
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+        a += weight * ambients[0];
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // ray is terminated if T is too small
+        // use a larger bound to further accelerate inference
+        if (T < T_thresh) break;
+
+        // locate
+        sigmas++;
+        rgbs += 3;
+        deltas += 2;
+        step++;
+        ambients++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // rays_alive = -1 means ray is terminated early.
+    if (step < n_step) {
+        rays_alive[n] = -1;
+    } else {
+        rays_t[0] = t;
+    }
+
+    weights_sum[0] = weight_sum; // this is the thing I needed!
+    depth[0] = d;
+    image[0] = r;
+    image[1] = g;
+    image[2] = b;
+    ambient_sum[0] = a;
+}
+
+
+void composite_rays_ambient_sigma(const uint32_t n_alive, const uint32_t n_step, const float T_thresh, at::Tensor rays_alive, at::Tensor rays_t, at::Tensor sigmas, at::Tensor rgbs, at::Tensor deltas, at::Tensor ambients, at::Tensor weights, at::Tensor depth, at::Tensor image, at::Tensor ambient_sum) {
+    static constexpr uint32_t N_THREAD = 128;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    image.scalar_type(), "composite_rays_ambient_sigma", ([&] {
+        kernel_composite_rays_ambient_sigma<<<div_round_up(n_alive, N_THREAD), N_THREAD>>>(n_alive, n_step, T_thresh, rays_alive.data_ptr<int>(), rays_t.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), ambients.data_ptr<scalar_t>(), weights.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), ambient_sum.data_ptr<scalar_t>());
+    }));
+}
+
+
+
+
+
+
+
+// -------------------------------- uncertainty -----------------------------
+
+// sigmas: [M]
+// rgbs: [M, 3]
+// deltas: [M, 2]
+// rays: [N, 3], idx, offset, num_steps
+// weights_sum: [N], final pixel alpha
+// depth: [N,]
+// image: [N, 3]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_train_uncertainty_forward(
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbs,  
+    const scalar_t * __restrict__ ambient,
+    const scalar_t * __restrict__ uncertainty,
+    const scalar_t * __restrict__ deltas,
+    const int * __restrict__ rays,
+    const uint32_t M, const uint32_t N, const float T_thresh, 
+    scalar_t * weights_sum,
+    scalar_t * ambient_sum,
+    scalar_t * uncertainty_sum,
+    scalar_t * depth,
+    scalar_t * image
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t index = rays[n * 3];
+    uint32_t offset = rays[n * 3 + 1];
+    uint32_t num_steps = rays[n * 3 + 2];
+
+    // empty ray, or ray that exceed max step count.
+    if (num_steps == 0 || offset + num_steps > M) {
+        weights_sum[index] = 0;
+        ambient_sum[index] = 0;
+        uncertainty_sum[index] = 0;
+        depth[index] = 0;
+        image[index * 3] = 0;
+        image[index * 3 + 1] = 0;
+        image[index * 3 + 2] = 0;
+        return;
+    }
+
+    sigmas += offset;
+    rgbs += offset * 3;
+    ambient += offset;
+    uncertainty += offset;
+    deltas += offset * 2;
+
+    // accumulate 
+    uint32_t step = 0;
+
+    scalar_t T = 1.0f;
+    scalar_t r = 0, g = 0, b = 0, ws = 0, d = 0, amb = 0, unc = 0;
+
+    while (step < num_steps) {
+
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t weight = alpha * T;
+
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+
+        d += weight * deltas[1];
+        
+        ws += weight;
+
+        amb += ambient[0];
+        unc += weight * uncertainty[0];
+
+        T *= 1.0f - alpha;
+
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // locate
+        sigmas++;
+        rgbs += 3;
+        ambient++;
+        uncertainty++;
+        deltas += 2;
+
+        step++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // write
+    weights_sum[index] = ws; // weights_sum
+    ambient_sum[index] = amb;
+    uncertainty_sum[index] = unc;
+    depth[index] = d;
+    image[index * 3] = r;
+    image[index * 3 + 1] = g;
+    image[index * 3 + 2] = b;
+}
+
+
+void composite_rays_train_uncertainty_forward(const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor ambient, const at::Tensor uncertainty, const at::Tensor deltas, const at::Tensor rays, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor weights_sum, at::Tensor ambient_sum, at::Tensor uncertainty_sum, at::Tensor depth, at::Tensor image) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    sigmas.scalar_type(), "composite_rays_train_uncertainty_forward", ([&] {
+        kernel_composite_rays_train_uncertainty_forward<<<div_round_up(N, N_THREAD), N_THREAD>>>(sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), ambient.data_ptr<scalar_t>(), uncertainty.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), M, N, T_thresh, weights_sum.data_ptr<scalar_t>(), ambient_sum.data_ptr<scalar_t>(), uncertainty_sum.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>());
+    }));
+}
+
+
+// grad_weights_sum: [N,]
+// grad: [N, 3]
+// sigmas: [M]
+// rgbs: [M, 3]
+// deltas: [M, 2]
+// rays: [N, 3], idx, offset, num_steps
+// weights_sum: [N,], weights_sum here 
+// image: [N, 3]
+// grad_sigmas: [M]
+// grad_rgbs: [M, 3]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_train_uncertainty_backward(
+    const scalar_t * __restrict__ grad_weights_sum,
+    const scalar_t * __restrict__ grad_ambient_sum,
+    const scalar_t * __restrict__ grad_uncertainty_sum,
+    const scalar_t * __restrict__ grad_image,
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbs, 
+    const scalar_t * __restrict__ ambient, 
+    const scalar_t * __restrict__ uncertainty, 
+    const scalar_t * __restrict__ deltas,
+    const int * __restrict__ rays,
+    const scalar_t * __restrict__ weights_sum,
+    const scalar_t * __restrict__ ambient_sum,
+    const scalar_t * __restrict__ uncertainty_sum,
+    const scalar_t * __restrict__ image,
+    const uint32_t M, const uint32_t N, const float T_thresh,
+    scalar_t * grad_sigmas,
+    scalar_t * grad_rgbs,
+    scalar_t * grad_ambient,
+    scalar_t * grad_uncertainty
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t index = rays[n * 3];
+    uint32_t offset = rays[n * 3 + 1];
+    uint32_t num_steps = rays[n * 3 + 2];
+
+    if (num_steps == 0 || offset + num_steps > M) return;
+
+    grad_weights_sum += index;
+    grad_ambient_sum += index;
+    grad_uncertainty_sum += index;
+    grad_image += index * 3;
+    weights_sum += index;
+    ambient_sum += index;
+    uncertainty_sum += index;
+    image += index * 3;
+
+    sigmas += offset;
+    rgbs += offset * 3;
+    ambient += offset;
+    uncertainty += offset;
+    deltas += offset * 2;
+
+    grad_sigmas += offset;
+    grad_rgbs += offset * 3;
+    grad_ambient += offset;
+    grad_uncertainty += offset;
+
+    // accumulate 
+    uint32_t step = 0;
+    
+    scalar_t T = 1.0f;
+    const scalar_t r_final = image[0], g_final = image[1], b_final = image[2], ws_final = weights_sum[0], amb_final = ambient_sum[0], unc_final = uncertainty_sum[0];
+    scalar_t r = 0, g = 0, b = 0, ws = 0, amb = 0, unc = 0;
+
+    while (step < num_steps) {
+        
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t weight = alpha * T;
+
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+        // amb += ambient[0];
+        unc += weight * uncertainty[0];
+        ws += weight;
+
+        T *= 1.0f - alpha;
+
+        // check https://note.kiui.moe/others/nerf_gradient/ for the gradient calculation.
+        // write grad_rgbs
+        grad_rgbs[0] = grad_image[0] * weight;
+        grad_rgbs[1] = grad_image[1] * weight;
+        grad_rgbs[2] = grad_image[2] * weight;
+        
+        // write grad_ambient
+        grad_ambient[0] = grad_ambient_sum[0];
+
+        // write grad_unc
+        grad_uncertainty[0] = grad_uncertainty_sum[0] * weight;
+
+        // write grad_sigmas
+        grad_sigmas[0] = deltas[0] * (
+            grad_image[0] * (T * rgbs[0] - (r_final - r)) + 
+            grad_image[1] * (T * rgbs[1] - (g_final - g)) + 
+            grad_image[2] * (T * rgbs[2] - (b_final - b)) +
+            // grad_ambient_sum[0] * (T * ambient[0] - (amb_final - amb)) +
+            grad_uncertainty_sum[0] * (T * uncertainty[0] - (unc_final - unc)) +
+            grad_weights_sum[0] * (1 - ws_final)
+        );
+
+        //printf("[n=%d] num_steps=%d, T=%f, grad_sigmas=%f, r_final=%f, r=%f\n", n, step, T, grad_sigmas[0], r_final, r);
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+    
+        // locate
+        sigmas++;
+        rgbs += 3;
+        // ambient++;
+        uncertainty++;
+        deltas += 2;
+        grad_sigmas++;
+        grad_rgbs += 3;
+        grad_ambient++;
+        grad_uncertainty++;
+
+        step++;
+    }
+}
+
+
+void composite_rays_train_uncertainty_backward(const at::Tensor grad_weights_sum, const at::Tensor grad_ambient_sum, const at::Tensor grad_uncertainty_sum, const at::Tensor grad_image, const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor ambient, const at::Tensor uncertainty, const at::Tensor deltas, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor ambient_sum, const at::Tensor uncertainty_sum, const at::Tensor image, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor grad_sigmas, at::Tensor grad_rgbs, at::Tensor grad_ambient, at::Tensor grad_uncertainty) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    grad_image.scalar_type(), "composite_rays_train_uncertainty_backward", ([&] {
+        kernel_composite_rays_train_uncertainty_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights_sum.data_ptr<scalar_t>(), grad_ambient_sum.data_ptr<scalar_t>(), grad_uncertainty_sum.data_ptr<scalar_t>(), grad_image.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), ambient.data_ptr<scalar_t>(), uncertainty.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), ambient_sum.data_ptr<scalar_t>(), uncertainty_sum.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), M, N, T_thresh, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>(), grad_ambient.data_ptr<scalar_t>(), grad_uncertainty.data_ptr<scalar_t>());
+    }));
+}
+
+
+////////////////////////////////////////////////////
+/////////////          infernce        /////////////
+////////////////////////////////////////////////////
+
+
+template <typename scalar_t>
+__global__ void kernel_composite_rays_uncertainty(
+    const uint32_t n_alive, 
+    const uint32_t n_step, 
+    const float T_thresh,
+    int* rays_alive, 
+    scalar_t* rays_t, 
+    const scalar_t* __restrict__ sigmas, 
+    const scalar_t* __restrict__ rgbs, 
+    const scalar_t* __restrict__ deltas, 
+    const scalar_t* __restrict__ ambients, 
+    const scalar_t* __restrict__ uncertainties, 
+    scalar_t* weights_sum, scalar_t* depth, scalar_t* image, scalar_t* ambient_sum, scalar_t* uncertainty_sum
+) {
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= n_alive) return;
+
+    const int index = rays_alive[n]; // ray id
+    
+    // locate 
+    sigmas += n * n_step;
+    rgbs += n * n_step * 3;
+    deltas += n * n_step * 2;
+    ambients += n * n_step;
+    uncertainties += n * n_step;
+
+    rays_t += index;
+    weights_sum += index;
+    depth += index;
+    image += index * 3;
+    ambient_sum += index;
+    uncertainty_sum += index;
+
+    scalar_t t = rays_t[0]; // current ray's t
+    
+    scalar_t weight_sum = weights_sum[0];
+    scalar_t d = depth[0];
+    scalar_t r = image[0];
+    scalar_t g = image[1];
+    scalar_t b = image[2];
+    scalar_t a = ambient_sum[0];
+    scalar_t u = uncertainty_sum[0];
+
+    // accumulate 
+    uint32_t step = 0;
+    while (step < n_step) {
+        
+        // ray is terminated if delta == 0
+        if (deltas[0] == 0) break;
+        
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+
+        /* 
+        T_0 = 1; T_i = \prod_{j=0}^{i-1} (1 - alpha_j)
+        w_i = alpha_i * T_i
+        --> 
+        T_i = 1 - \sum_{j=0}^{i-1} w_j
+        */
+        const scalar_t T = 1 - weight_sum;
+        const scalar_t weight = alpha * T;
+        weight_sum += weight;
+
+        t = deltas[1];
+        d += weight * t;
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+        a += ambients[0];
+        u += weight * uncertainties[0];
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // ray is terminated if T is too small
+        // use a larger bound to further accelerate inference
+        if (T < T_thresh) break;
+
+        // locate
+        sigmas++;
+        rgbs += 3;
+        deltas += 2;
+        step++;
+        ambients++;
+        uncertainties++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // rays_alive = -1 means ray is terminated early.
+    if (step < n_step) {
+        rays_alive[n] = -1;
+    } else {
+        rays_t[0] = t;
+    }
+
+    weights_sum[0] = weight_sum; // this is the thing I needed!
+    depth[0] = d;
+    image[0] = r;
+    image[1] = g;
+    image[2] = b;
+    ambient_sum[0] = a;
+    uncertainty_sum[0] = u;
+}
+
+
+void composite_rays_uncertainty(const uint32_t n_alive, const uint32_t n_step, const float T_thresh, at::Tensor rays_alive, at::Tensor rays_t, at::Tensor sigmas, at::Tensor rgbs, at::Tensor deltas, at::Tensor ambients, at::Tensor uncertainties, at::Tensor weights, at::Tensor depth, at::Tensor image, at::Tensor ambient_sum, at::Tensor uncertainty_sum) {
+    static constexpr uint32_t N_THREAD = 128;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    image.scalar_type(), "composite_rays_uncertainty", ([&] {
+        kernel_composite_rays_uncertainty<<<div_round_up(n_alive, N_THREAD), N_THREAD>>>(n_alive, n_step, T_thresh, rays_alive.data_ptr<int>(), rays_t.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), ambients.data_ptr<scalar_t>(), uncertainties.data_ptr<scalar_t>(), weights.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), ambient_sum.data_ptr<scalar_t>(), uncertainty_sum.data_ptr<scalar_t>());
+    }));
+}
+
+
+
+
+// -------------------------------- triplane -----------------------------
+
+// sigmas: [M]
+// rgbs: [M, 3]
+// deltas: [M, 2]
+// rays: [N, 3], idx, offset, num_steps
+// weights_sum: [N], final pixel alpha
+// depth: [N,]
+// image: [N, 3]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_train_triplane_forward(
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbs,  
+    const scalar_t * __restrict__ amb_aud,
+    const scalar_t * __restrict__ amb_eye,
+    const scalar_t * __restrict__ uncertainty,
+    const scalar_t * __restrict__ deltas,
+    const int * __restrict__ rays,
+    const uint32_t M, const uint32_t N, const float T_thresh, 
+    scalar_t * weights_sum,
+    scalar_t * amb_aud_sum,
+    scalar_t * amb_eye_sum,
+    scalar_t * uncertainty_sum,
+    scalar_t * depth,
+    scalar_t * image
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t index = rays[n * 3];
+    uint32_t offset = rays[n * 3 + 1];
+    uint32_t num_steps = rays[n * 3 + 2];
+
+    // empty ray, or ray that exceed max step count.
+    if (num_steps == 0 || offset + num_steps > M) {
+        weights_sum[index] = 0;
+        amb_aud_sum[index] = 0;
+        amb_eye_sum[index] = 0;
+        uncertainty_sum[index] = 0;
+        depth[index] = 0;
+        image[index * 3] = 0;
+        image[index * 3 + 1] = 0;
+        image[index * 3 + 2] = 0;
+        return;
+    }
+
+    sigmas += offset;
+    rgbs += offset * 3;
+    amb_aud += offset;
+    amb_eye += offset;
+    uncertainty += offset;
+    deltas += offset * 2;
+
+    // accumulate 
+    uint32_t step = 0;
+
+    scalar_t T = 1.0f;
+    scalar_t r = 0, g = 0, b = 0, ws = 0, d = 0, a_aud = 0, a_eye=0, unc = 0;
+
+    while (step < num_steps) {
+
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t weight = alpha * T;
+
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+
+        d += weight * deltas[1];
+        
+        ws += weight;
+
+        a_aud += amb_aud[0];
+        a_eye += amb_eye[0];
+        unc += weight * uncertainty[0];
+
+        T *= 1.0f - alpha;
+
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // locate
+        sigmas++;
+        rgbs += 3;
+        amb_aud++;
+        amb_eye++;
+        uncertainty++;
+        deltas += 2;
+
+        step++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // write
+    weights_sum[index] = ws; // weights_sum
+    amb_aud_sum[index] = a_aud;
+    amb_eye_sum[index] = a_eye;
+    uncertainty_sum[index] = unc;
+    depth[index] = d;
+    image[index * 3] = r;
+    image[index * 3 + 1] = g;
+    image[index * 3 + 2] = b;
+}
+
+
+void composite_rays_train_triplane_forward(const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor amb_aud, const at::Tensor amb_eye, const at::Tensor uncertainty, const at::Tensor deltas, const at::Tensor rays, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor weights_sum, at::Tensor amb_aud_sum, at::Tensor amb_eye_sum, at::Tensor uncertainty_sum, at::Tensor depth, at::Tensor image) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    sigmas.scalar_type(), "composite_rays_train_triplane_forward", ([&] {
+        kernel_composite_rays_train_triplane_forward<<<div_round_up(N, N_THREAD), N_THREAD>>>(sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), amb_aud.data_ptr<scalar_t>(), amb_eye.data_ptr<scalar_t>(), uncertainty.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), M, N, T_thresh, weights_sum.data_ptr<scalar_t>(), amb_aud_sum.data_ptr<scalar_t>(), amb_eye_sum.data_ptr<scalar_t>(), uncertainty_sum.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>());
+    }));
+}
+
+
+// grad_weights_sum: [N,]
+// grad: [N, 3]
+// sigmas: [M]
+// rgbs: [M, 3]
+// deltas: [M, 2]
+// rays: [N, 3], idx, offset, num_steps
+// weights_sum: [N,], weights_sum here 
+// image: [N, 3]
+// grad_sigmas: [M]
+// grad_rgbs: [M, 3]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_train_triplane_backward(
+    const scalar_t * __restrict__ grad_weights_sum,
+    const scalar_t * __restrict__ grad_amb_aud_sum,
+    const scalar_t * __restrict__ grad_amb_eye_sum,
+    const scalar_t * __restrict__ grad_uncertainty_sum,
+    const scalar_t * __restrict__ grad_image,
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbs, 
+    const scalar_t * __restrict__ amb_aud, 
+    const scalar_t * __restrict__ amb_eye, 
+    const scalar_t * __restrict__ uncertainty, 
+    const scalar_t * __restrict__ deltas,
+    const int * __restrict__ rays,
+    const scalar_t * __restrict__ weights_sum,
+    const scalar_t * __restrict__ amb_aud_sum,
+    const scalar_t * __restrict__ amb_eye_sum,
+    const scalar_t * __restrict__ uncertainty_sum,
+    const scalar_t * __restrict__ image,
+    const uint32_t M, const uint32_t N, const float T_thresh,
+    scalar_t * grad_sigmas,
+    scalar_t * grad_rgbs,
+    scalar_t * grad_amb_aud,
+    scalar_t * grad_amb_eye,
+    scalar_t * grad_uncertainty
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t index = rays[n * 3];
+    uint32_t offset = rays[n * 3 + 1];
+    uint32_t num_steps = rays[n * 3 + 2];
+
+    if (num_steps == 0 || offset + num_steps > M) return;
+
+    grad_weights_sum += index;
+    grad_amb_aud_sum += index;
+    grad_amb_eye_sum += index;
+    grad_uncertainty_sum += index;
+    grad_image += index * 3;
+    weights_sum += index;
+    amb_aud_sum += index;
+    amb_eye_sum += index;
+    uncertainty_sum += index;
+    image += index * 3;
+
+    sigmas += offset;
+    rgbs += offset * 3;
+    amb_aud += offset;
+    amb_eye += offset;
+    uncertainty += offset;
+    deltas += offset * 2;
+
+    grad_sigmas += offset;
+    grad_rgbs += offset * 3;
+    grad_amb_aud += offset;
+    grad_amb_eye += offset;
+    grad_uncertainty += offset;
+
+    // accumulate 
+    uint32_t step = 0;
+    
+    scalar_t T = 1.0f;
+    const scalar_t r_final = image[0], g_final = image[1], b_final = image[2], ws_final = weights_sum[0], unc_final = uncertainty_sum[0];
+    scalar_t r = 0, g = 0, b = 0, ws = 0, amb = 0, unc = 0;
+
+    while (step < num_steps) {
+        
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+        const scalar_t weight = alpha * T;
+
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+        // amb += ambient[0];
+        unc += weight * uncertainty[0];
+        ws += weight;
+
+        T *= 1.0f - alpha;
+
+        // check https://note.kiui.moe/others/nerf_gradient/ for the gradient calculation.
+        // write grad_rgbs
+        grad_rgbs[0] = grad_image[0] * weight;
+        grad_rgbs[1] = grad_image[1] * weight;
+        grad_rgbs[2] = grad_image[2] * weight;
+        
+        // write grad_ambient
+        grad_amb_aud[0] = grad_amb_aud_sum[0];
+        grad_amb_eye[0] = grad_amb_eye_sum[0];
+
+        // write grad_unc
+        grad_uncertainty[0] = grad_uncertainty_sum[0] * weight;
+
+        // write grad_sigmas
+        grad_sigmas[0] = deltas[0] * (
+            grad_image[0] * (T * rgbs[0] - (r_final - r)) + 
+            grad_image[1] * (T * rgbs[1] - (g_final - g)) + 
+            grad_image[2] * (T * rgbs[2] - (b_final - b)) +
+            // grad_ambient_sum[0] * (T * ambient[0] - (amb_final - amb)) +
+            grad_uncertainty_sum[0] * (T * uncertainty[0] - (unc_final - unc)) +
+            grad_weights_sum[0] * (1 - ws_final)
+        );
+
+        //printf("[n=%d] num_steps=%d, T=%f, grad_sigmas=%f, r_final=%f, r=%f\n", n, step, T, grad_sigmas[0], r_final, r);
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+    
+        // locate
+        sigmas++;
+        rgbs += 3;
+        // ambient++;
+        uncertainty++;
+        deltas += 2;
+        grad_sigmas++;
+        grad_rgbs += 3;
+        grad_amb_aud++;
+        grad_amb_eye++;
+        grad_uncertainty++;
+
+        step++;
+    }
+}
+
+
+void composite_rays_train_triplane_backward(const at::Tensor grad_weights_sum, const at::Tensor grad_amb_aud_sum, const at::Tensor grad_amb_eye_sum, const at::Tensor grad_uncertainty_sum, const at::Tensor grad_image, const at::Tensor sigmas, const at::Tensor rgbs, const at::Tensor amb_aud, const at::Tensor amb_eye, const at::Tensor uncertainty, const at::Tensor deltas, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor amb_aud_sum, const at::Tensor amb_eye_sum, const at::Tensor uncertainty_sum, const at::Tensor image, const uint32_t M, const uint32_t N, const float T_thresh, at::Tensor grad_sigmas, at::Tensor grad_rgbs, at::Tensor grad_amb_aud, at::Tensor grad_amb_eye, at::Tensor grad_uncertainty) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    grad_image.scalar_type(), "composite_rays_train_triplane_backward", ([&] {
+        kernel_composite_rays_train_triplane_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights_sum.data_ptr<scalar_t>(), grad_amb_aud_sum.data_ptr<scalar_t>(), grad_amb_eye_sum.data_ptr<scalar_t>(), grad_uncertainty_sum.data_ptr<scalar_t>(), grad_image.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), amb_aud.data_ptr<scalar_t>(), amb_eye.data_ptr<scalar_t>(), uncertainty.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), amb_aud_sum.data_ptr<scalar_t>(), amb_eye_sum.data_ptr<scalar_t>(), uncertainty_sum.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), M, N, T_thresh, grad_sigmas.data_ptr<scalar_t>(), grad_rgbs.data_ptr<scalar_t>(), grad_amb_aud.data_ptr<scalar_t>(), grad_amb_eye.data_ptr<scalar_t>(), grad_uncertainty.data_ptr<scalar_t>());
+    }));
+}
+
+
+////////////////////////////////////////////////////
+/////////////          infernce        /////////////
+////////////////////////////////////////////////////
+
+
+template <typename scalar_t>
+__global__ void kernel_composite_rays_triplane(
+    const uint32_t n_alive, 
+    const uint32_t n_step, 
+    const float T_thresh,
+    int* rays_alive, 
+    scalar_t* rays_t, 
+    const scalar_t* __restrict__ sigmas, 
+    const scalar_t* __restrict__ rgbs, 
+    const scalar_t* __restrict__ deltas, 
+    const scalar_t* __restrict__ ambs_aud, 
+    const scalar_t* __restrict__ ambs_eye, 
+    const scalar_t* __restrict__ uncertainties, 
+    scalar_t* weights_sum, scalar_t* depth, scalar_t* image, scalar_t* amb_aud_sum, scalar_t* amb_eye_sum, scalar_t* uncertainty_sum
+) {
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= n_alive) return;
+
+    const int index = rays_alive[n]; // ray id
+    
+    // locate 
+    sigmas += n * n_step;
+    rgbs += n * n_step * 3;
+    deltas += n * n_step * 2;
+    ambs_aud += n * n_step;
+    ambs_eye += n * n_step;
+    uncertainties += n * n_step;
+
+    rays_t += index;
+    weights_sum += index;
+    depth += index;
+    image += index * 3;
+    amb_aud_sum += index;
+    amb_eye_sum += index;
+    uncertainty_sum += index;
+
+    scalar_t t = rays_t[0]; // current ray's t
+    
+    scalar_t weight_sum = weights_sum[0];
+    scalar_t d = depth[0];
+    scalar_t r = image[0];
+    scalar_t g = image[1];
+    scalar_t b = image[2];
+    scalar_t a_aud = amb_aud_sum[0];
+    scalar_t a_eye = amb_eye_sum[0];
+    scalar_t u = uncertainty_sum[0];
+
+    // accumulate 
+    uint32_t step = 0;
+    while (step < n_step) {
+        
+        // ray is terminated if delta == 0
+        if (deltas[0] == 0) break;
+        
+        const scalar_t alpha = 1.0f - __expf(- sigmas[0] * deltas[0]);
+
+        /* 
+        T_0 = 1; T_i = \prod_{j=0}^{i-1} (1 - alpha_j)
+        w_i = alpha_i * T_i
+        --> 
+        T_i = 1 - \sum_{j=0}^{i-1} w_j
+        */
+        const scalar_t T = 1 - weight_sum;
+        const scalar_t weight = alpha * T;
+        weight_sum += weight;
+
+        t = deltas[1];
+        d += weight * t;
+        r += weight * rgbs[0];
+        g += weight * rgbs[1];
+        b += weight * rgbs[2];
+        a_aud += ambs_aud[0];
+        a_eye += ambs_eye[0];
+        u += weight * uncertainties[0];
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // ray is terminated if T is too small
+        // use a larger bound to further accelerate inference
+        if (T < T_thresh) break;
+
+        // locate
+        sigmas++;
+        rgbs += 3;
+        deltas += 2;
+        step++;
+        ambs_aud++;
+        ambs_eye++;
+        uncertainties++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // rays_alive = -1 means ray is terminated early.
+    if (step < n_step) {
+        rays_alive[n] = -1;
+    } else {
+        rays_t[0] = t;
+    }
+
+    weights_sum[0] = weight_sum; // this is the thing I needed!
+    depth[0] = d;
+    image[0] = r;
+    image[1] = g;
+    image[2] = b;
+    amb_aud_sum[0] = a_aud;
+    amb_eye_sum[0] = a_eye;
+    uncertainty_sum[0] = u;
+}
+
+
+void composite_rays_triplane(const uint32_t n_alive, const uint32_t n_step, const float T_thresh, at::Tensor rays_alive, at::Tensor rays_t, at::Tensor sigmas, at::Tensor rgbs, at::Tensor deltas, at::Tensor ambs_aud, at::Tensor ambs_eye, at::Tensor uncertainties, at::Tensor weights, at::Tensor depth, at::Tensor image, at::Tensor amb_aud_sum, at::Tensor amb_eye_sum, at::Tensor uncertainty_sum) {
+    static constexpr uint32_t N_THREAD = 128;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    image.scalar_type(), "composite_rays_triplane", ([&] {
+        kernel_composite_rays_triplane<<<div_round_up(n_alive, N_THREAD), N_THREAD>>>(n_alive, n_step, T_thresh, rays_alive.data_ptr<int>(), rays_t.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), deltas.data_ptr<scalar_t>(), ambs_aud.data_ptr<scalar_t>(), ambs_eye.data_ptr<scalar_t>(), uncertainties.data_ptr<scalar_t>(), weights.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>(), amb_aud_sum.data_ptr<scalar_t>(), amb_eye_sum.data_ptr<scalar_t>(), uncertainty_sum.data_ptr<scalar_t>());
+    }));
+}

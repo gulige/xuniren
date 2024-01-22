@@ -140,6 +140,11 @@ class NeRFDataset_Test:
 
             print(f'[INFO] load {self.opt.aud} aud_features: {aud_features.shape}')
 
+        # load action units
+        import pandas as pd
+        au_blink_info=pd.read_csv(os.path.join('data/au.csv'))
+        au_blink = au_blink_info[' AU45_r'].values
+        
         self.poses = []
         self.auds = []
         self.eye_area = []
@@ -157,10 +162,13 @@ class NeRFDataset_Test:
 
             if self.opt.exp_eye:
                 
-                if 'eye_ratio' in f:
-                    area = f['eye_ratio']
-                else:
-                    area = 0.25 # default value for opened eye
+                #if 'eye_ratio' in f:
+                #    area = f['eye_ratio']
+                #else:
+                #    area = 0.25 # default value for opened eye
+                # action units blink AU45
+                area = au_blink[f['img_id']]
+                area = np.clip(area, 0, 2) / 2
                 
                 self.eye_area.append(area)
         
@@ -284,9 +292,10 @@ class NeRFDataset_Test:
         bg_coords = self.bg_coords # [1, N, 2]
         results['bg_coords'] = bg_coords
 
-        results['poses'] = convert_poses(poses) # [B, 6]
-        results['poses_matrix'] = poses # [B, 4, 4]
-            
+        # results['poses'] = convert_poses(poses) # [B, 6]
+        # results['poses_matrix'] = poses # [B, 4, 4]
+        results['poses'] = poses # [B, 4, 4]
+
         return results
 
     def dataloader(self):
@@ -393,6 +402,10 @@ class NeRFDataset:
                     aud_features = np.load(os.path.join(self.root_path, 'aud_eo.npy'))
                 elif 'deepspeech' in self.opt.asr_model:
                     aud_features = np.load(os.path.join(self.root_path, 'aud_ds.npy'))
+                # elif 'hubert_cn' in self.opt.asr_model:
+                #     aud_features = np.load(os.path.join(self.root_path, 'aud_hu_cn.npy'))
+                elif 'hubert' in self.opt.asr_model:
+                    aud_features = np.load(os.path.join(self.root_path, 'aud_hu.npy'))
                 else:
                     aud_features = np.load(os.path.join(self.root_path, 'aud.npy'))
             # cross-driven extracted features. 
@@ -415,6 +428,11 @@ class NeRFDataset:
 
             print(f'[INFO] load {self.opt.aud} aud_features: {aud_features.shape}')
 
+        # load action units
+        import pandas as pd
+        au_blink_info=pd.read_csv(os.path.join(self.root_path, 'au.csv'))
+        au_blink = au_blink_info[' AU45_r'].values
+
         self.torso_img = []
         self.images = []
 
@@ -423,8 +441,10 @@ class NeRFDataset:
 
         self.auds = []
         self.face_rect = []
+        self.lhalf_rect = []
         self.lips_rect = []
         self.eye_area = []
+        self.eye_rect = []
 
         for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
 
@@ -468,21 +488,31 @@ class NeRFDataset:
             # load lms and extract face
             lms = np.loadtxt(os.path.join(self.root_path, 'ori_imgs', str(f['img_id']) + '.lms')) # [68, 2]
 
-            xmin, xmax = int(lms[31:36, 1].min()), int(lms[:, 1].max())
+            lh_xmin, lh_xmax = int(lms[31:36, 1].min()), int(lms[:, 1].max()) # actually lower half area
+            xmin, xmax = int(lms[:, 1].min()), int(lms[:, 1].max())
             ymin, ymax = int(lms[:, 0].min()), int(lms[:, 0].max())
             self.face_rect.append([xmin, xmax, ymin, ymax])
+            self.lhalf_rect.append([lh_xmin, lh_xmax, ymin, ymax])
 
             if self.opt.exp_eye:
-                eyes_left = slice(36, 42)
-                eyes_right = slice(42, 48)
+                # eyes_left = slice(36, 42)
+                # eyes_right = slice(42, 48)
 
-                area_left = polygon_area(lms[eyes_left, 0], lms[eyes_left, 1])
-                area_right = polygon_area(lms[eyes_right, 0], lms[eyes_right, 1])
+                # area_left = polygon_area(lms[eyes_left, 0], lms[eyes_left, 1])
+                # area_right = polygon_area(lms[eyes_right, 0], lms[eyes_right, 1])
 
-                # area percentage of two eyes of the whole image...
-                area = (area_left + area_right) / (self.H * self.W) * 100
+                # # area percentage of two eyes of the whole image...
+                # area = (area_left + area_right) / (self.H * self.W) * 100
 
+                # action units blink AU45
+                area = au_blink[f['img_id']]
+                area = np.clip(area, 0, 2) / 2
+                # area = area + np.random.rand() / 10
                 self.eye_area.append(area)
+
+                xmin, xmax = int(lms[36:48, 1].min()), int(lms[36:48, 1].max())
+                ymin, ymax = int(lms[36:48, 0].min()), int(lms[36:48, 0].max())
+                self.eye_rect.append([xmin, xmax, ymin, ymax])
 
             if self.opt.finetune_lips:
                 lips = slice(48, 60)
@@ -657,9 +687,19 @@ class NeRFDataset:
             xmin, xmax, ymin, ymax = self.face_rect[index[0]]
             face_mask = (rays['j'] >= xmin) & (rays['j'] < xmax) & (rays['i'] >= ymin) & (rays['i'] < ymax) # [B, N]
             results['face_mask'] = face_mask
+            
+            xmin, xmax, ymin, ymax = self.lhalf_rect[index[0]]
+            lhalf_mask = (rays['j'] >= xmin) & (rays['j'] < xmax) & (rays['i'] >= ymin) & (rays['i'] < ymax) # [B, N]
+            results['lhalf_mask'] = lhalf_mask
 
         if self.opt.exp_eye:
             results['eye'] = self.eye_area[index].to(self.device) # [1]
+            if self.training:
+                results['eye'] += (np.random.rand()-0.5) / 10
+                xmin, xmax, ymin, ymax = self.eye_rect[index[0]]
+                eye_mask = (rays['j'] >= xmin) & (rays['j'] < xmax) & (rays['i'] >= ymin) & (rays['i'] < ymax) # [B, N]
+                results['eye_mask'] = eye_mask
+
         else:
             results['eye'] = None
 
@@ -708,8 +748,9 @@ class NeRFDataset:
 
         results['bg_coords'] = bg_coords
 
-        results['poses'] = convert_poses(poses) # [B, 6]
-        results['poses_matrix'] = poses # [B, 4, 4]
+        # results['poses'] = convert_poses(poses) # [B, 6]
+        # results['poses_matrix'] = poses # [B, 4, 4]
+        results['poses'] = poses # [B, 4, 4]
             
         return results
 

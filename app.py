@@ -51,7 +51,7 @@ def send_information(path, ws):
 def txt_to_audio(text_):
     audio_list = []
     audio_path = 'data/audio/aud_0.wav'
-    voicename = "zh-CN-YunxiaNeural"
+    voicename = "zh-CN-XiaoxiaoNeural"
     # 让我们一起学习。必应由 AI 提供支持，因此可能出现意外和错误。请确保核对事实，并 共享反馈以便我们可以学习和改进!
     text = text_
     asyncio.get_event_loop().run_until_complete(main(voicename,text,audio_path))

@@ -324,8 +324,9 @@ def get_rays(poses, intrinsics, H, W, N=-1, patch_size=1, rect=None):
     ys = (j - cy) / fy * zs
     directions = torch.stack((xs, ys, zs), dim=-1)
     directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+    
     rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3)
-
+    
     rays_o = poses[..., :3, 3] # [B, 3]
     rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
 
@@ -493,8 +494,10 @@ class LMDMeter:
         else:
 
             import face_alignment
-
-            self.predictor = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False)
+            try:
+                self.predictor = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False)
+            except:
+                self.predictor = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
 
         self.V = 0
         self.N = 0
@@ -614,6 +617,7 @@ class Trainer(object):
         self.use_checkpoint = use_checkpoint
         self.use_tensorboardX = use_tensorboardX
         self.flip_finetune_lips = self.opt.finetune_lips
+        self.flip_init_lips = self.opt.init_lips
         self.time_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
@@ -647,9 +651,10 @@ class Trainer(object):
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.fp16)
 
         # optionally use LPIPS loss for patch-based training
-        if self.opt.patch_size > 1 or self.opt.finetune_lips:
+        if self.opt.patch_size > 1 or self.opt.finetune_lips or True:
             import lpips
-            self.criterion_lpips = lpips.LPIPS(net='alex').to(self.device)
+            # self.criterion_lpips_vgg = lpips.LPIPS(net='vgg').to(self.device)
+            self.criterion_lpips_alex = lpips.LPIPS(net='alex').to(self.device)
 
         # variable init
         self.epoch = 0
@@ -724,6 +729,8 @@ class Trainer(object):
         bg_coords = data['bg_coords'] # [1, N, 2]
         poses = data['poses'] # [B, 6]
         face_mask = data['face_mask'] # [B, N]
+        eye_mask = data['eye_mask'] # [B, N]
+        lhalf_mask = data['lhalf_mask']
         eye = data['eye'] # [B, 1]
         auds = data['auds'] # [B, 29, 16]
         index = data['index'] # [B]
@@ -740,48 +747,87 @@ class Trainer(object):
          
         bg_color = data['bg_color']
         
-        outputs = self.model.render(rays_o, rays_d, auds, bg_coords, poses, eye=eye, index=index, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if (self.opt.patch_size <= 1 and not self.opt.train_camera) else True, **vars(self.opt))
+        if not self.opt.torso:
+            outputs = self.model.render(rays_o, rays_d, auds, bg_coords, poses, eye=eye, index=index, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if (self.opt.patch_size <= 1 and not self.opt.train_camera) else True, **vars(self.opt))
+        else:
+            outputs = self.model.render_torso(rays_o, rays_d, auds, bg_coords, poses, eye=eye, index=index, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if (self.opt.patch_size <= 1 and not self.opt.train_camera) else True, **vars(self.opt))
 
         if not self.opt.torso:
             pred_rgb = outputs['image']
         else:
             pred_rgb = outputs['torso_color']
 
+
+        # loss factor
+        step_factor = min(self.global_step / self.opt.iters, 1.0)
+
         # MSE loss
         loss = self.criterion(pred_rgb, rgb).mean(-1) # [B, N, 3] --> [B, N]
-        #loss.requires_grad_(True)
+
+        if self.opt.torso:
+            loss = loss.mean()
+            loss += ((1 - self.model.anchor_points[:, 3])**2).mean()
+            return  pred_rgb, rgb, loss
+
         # camera optim regularization
         # if self.opt.train_camera:
         #     cam_reg = self.model.camera_dR[index].abs().mean() + self.model.camera_dT[index].abs().mean() 
         #     loss = loss + 1e-2 * cam_reg
 
-        # lips finetune
-        if self.opt.finetune_lips:
-            xmin, xmax, ymin, ymax = data['rect']
-            rgb = rgb.view(-1, xmax - xmin, ymax - ymin, 3).permute(0, 3, 1, 2).contiguous()
-            pred_rgb = pred_rgb.view(-1, xmax - xmin, ymax - ymin, 3).permute(0, 3, 1, 2).contiguous()
+        if self.opt.unc_loss and not self.flip_finetune_lips:
+            alpha = 0.2
+            uncertainty = outputs['uncertainty'] # [N], abs sum
+            beta = uncertainty + 1
 
-            # torch_vis_2d(rgb[0])
-            # torch_vis_2d(pred_rgb[0])
+            unc_weight = F.softmax(uncertainty, dim=-1) * N
+            # print(unc_weight.shape, unc_weight.max(), unc_weight.min())
+            loss *= alpha + (1-alpha)*((1 - step_factor) + step_factor * unc_weight.detach()).clamp(0, 10)            
+            # loss *= unc_weight.detach()
 
-            # LPIPS loss
-            loss = loss + 0.01 * self.criterion_lpips(pred_rgb, rgb)
+            beta = uncertainty + 1
+            norm_rgb = torch.norm((pred_rgb - rgb), dim=-1).detach()
+            loss_u = norm_rgb / (2*beta**2) + (torch.log(beta)**2) / 2
+            loss_u *= face_mask.view(-1)
+            loss += step_factor * loss_u
+
+            loss_static_uncertainty = (uncertainty * (~face_mask.view(-1)))
+            loss += 1e-3 * step_factor * loss_static_uncertainty
         
-        # flip every step... if finetune lips
-        if self.flip_finetune_lips:
-            self.opt.finetune_lips = not self.opt.finetune_lips
-
         # patch-based rendering
-        if self.opt.patch_size > 1:
-            rgb = rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
-            pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous()
+        if self.opt.patch_size > 1 and not self.opt.finetune_lips:
+            rgb = rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous() * 2 - 1
+            pred_rgb = pred_rgb.view(-1, self.opt.patch_size, self.opt.patch_size, 3).permute(0, 3, 1, 2).contiguous() * 2 - 1
 
             # torch_vis_2d(rgb[0])
             # torch_vis_2d(pred_rgb[0])
 
             # LPIPS loss ?
-            loss = loss + 0.001 * self.criterion_lpips(pred_rgb, rgb)
+            loss_lpips = self.criterion_lpips_alex(pred_rgb, rgb)
+            loss = loss + 0.1 * loss_lpips
 
+        # lips finetune
+        if self.opt.finetune_lips:
+            xmin, xmax, ymin, ymax = data['rect']
+            rgb = rgb.view(-1, xmax - xmin, ymax - ymin, 3).permute(0, 3, 1, 2).contiguous() * 2 - 1
+            pred_rgb = pred_rgb.view(-1, xmax - xmin, ymax - ymin, 3).permute(0, 3, 1, 2).contiguous() * 2 - 1
+
+            padding_h = max(0, (32 - rgb.shape[-2] + 1) // 2)
+            padding_w = max(0, (32 - rgb.shape[-1] + 1) // 2)
+
+            if padding_w or padding_h:
+                rgb = torch.nn.functional.pad(rgb, (padding_w, padding_w, padding_h, padding_h))
+                pred_rgb = torch.nn.functional.pad(pred_rgb, (padding_w, padding_w, padding_h, padding_h))
+
+            # torch_vis_2d(rgb[0])
+            # torch_vis_2d(pred_rgb[0])
+            
+            # LPIPS loss
+            loss = loss + 0.01 * self.criterion_lpips_alex(pred_rgb, rgb)
+        
+        # flip every step... if finetune lips
+        if self.flip_finetune_lips:
+            self.opt.finetune_lips = not self.opt.finetune_lips
+        
         loss = loss.mean()
 
         # weights_sum loss
@@ -797,17 +843,42 @@ class Trainer(object):
             loss_ws = - alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)
             loss = loss + 1e-4 * loss_ws.mean()
 
-        # ambient loss (regions out of face should be static)
-        if not self.opt.torso:
-            ambient = outputs['ambient'] # [N], abs sum
-            loss_amb = (ambient * (~face_mask.view(-1))).mean()
-
+        # aud att loss (regions out of face should be static)
+        if self.opt.amb_aud_loss and not self.opt.torso:
+            ambient_aud = outputs['ambient_aud']
+            loss_amb_aud = (ambient_aud * (~face_mask.view(-1))).mean()
             # gradually increase it
-            lambda_amb = min(self.global_step / self.opt.iters, 1.0) * self.opt.lambda_amb 
-            # lambda_amb = self.opt.lambda_amb
-            loss = loss + lambda_amb * loss_amb
+            lambda_amb = step_factor * self.opt.lambda_amb 
+            loss += lambda_amb * loss_amb_aud
+
+        # eye att loss
+        if self.opt.amb_eye_loss and not self.opt.torso:
+            ambient_eye = outputs['ambient_eye'] / self.opt.max_steps
+
+            loss_cross = ((ambient_eye * ambient_aud.detach())*face_mask.view(-1)).mean()
+            loss += lambda_amb * loss_cross
+        
+        # regularize
+        if self.global_step % 16 == 0 and not self.flip_finetune_lips:
+            xyzs, dirs, enc_a, ind_code, eye = outputs['rays']
+            xyz_delta = (torch.rand(size=xyzs.shape, dtype=xyzs.dtype, device=xyzs.device) * 2 - 1) * 1e-3
+            with torch.no_grad():
+                sigmas_raw, rgbs_raw, ambient_aud_raw, ambient_eye_raw, unc_raw = self.model(xyzs, dirs, enc_a.detach(), ind_code.detach(), eye)
+            sigmas_reg, rgbs_reg, ambient_aud_reg, ambient_eye_reg, unc_reg = self.model(xyzs+xyz_delta, dirs, enc_a.detach(), ind_code.detach(), eye)
+
+            lambda_reg = step_factor * 1e-5
+            reg_loss = 0
+            if self.opt.unc_loss:
+                reg_loss += self.criterion(unc_raw, unc_reg).mean() 
+            if self.opt.amb_aud_loss:
+                reg_loss += self.criterion(ambient_aud_raw, ambient_aud_reg).mean()
+            if self.opt.amb_eye_loss:
+                reg_loss += self.criterion(ambient_eye_raw, ambient_eye_reg).mean()
+            
+            loss += reg_loss * lambda_reg
 
         return pred_rgb, rgb, loss
+
 
     def eval_step(self, data):
 
@@ -834,10 +905,14 @@ class Trainer(object):
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_depth = outputs['depth'].reshape(B, H, W)
+        pred_ambient_aud = outputs['ambient_aud'].reshape(B, H, W)
+        pred_ambient_eye = outputs['ambient_eye'].reshape(B, H, W)
+        pred_uncertainty = outputs['uncertainty'].reshape(B, H, W)
 
-        loss = self.criterion(pred_rgb, images).mean()
+        loss_raw = self.criterion(pred_rgb, images)
+        loss = loss_raw.mean()
 
-        return pred_rgb, pred_depth, images, loss
+        return pred_rgb, pred_depth, pred_ambient_aud, pred_ambient_eye, pred_uncertainty, images, loss, loss_raw
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
@@ -862,7 +937,9 @@ class Trainer(object):
         else:
             bg_color = data['bg_color']
 
+        self.model.testing = True
         outputs = self.model.render(rays_o, rays_d, auds, bg_coords, poses, eye=eye, index=index, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
+        self.model.testing = False
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         pred_depth = outputs['depth'].reshape(-1, H, W)
@@ -937,7 +1014,9 @@ class Trainer(object):
         pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         self.model.eval()
         video_stream.set_video_len(int(len(loader) * loader.batch_size))
+
         all_preds = []
+        all_preds_depth = []
 
         with torch.no_grad():
 
@@ -965,13 +1044,17 @@ class Trainer(object):
                     imageio.imwrite(path_depth, pred_depth)
                 #保存视频流
                 video_stream.write([pred])
+
                 all_preds.append(pred)
+                all_preds_depth.append(pred_depth)
 
                 pbar.update(loader.batch_size)
 
         # write video
         all_preds = np.stack(all_preds, axis=0)
+        all_preds_depth = np.stack(all_preds_depth, axis=0)
         imageio.mimwrite(os.path.join(save_path, f'{name}.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
+        imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
 
         self.log(f"==> Finished Test.")
     
@@ -1065,7 +1148,7 @@ class Trainer(object):
             'auds': auds,
             'index': [index], # support choosing index for individual codes
             'eye': eye,
-            'poses': convert_poses(pose),
+            'poses': pose,
             'bg_coords': bg_coords,
         }
         
@@ -1154,12 +1237,11 @@ class Trainer(object):
             loader.sampler.set_epoch(self.epoch)
         
         if self.local_rank == 0:
-            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, mininterval=1, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         self.local_step = 0
 
         for data in loader:
-            
             # update grid every 16 steps
             if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
                 with torch.cuda.amp.autocast(enabled=self.fp16):
@@ -1172,7 +1254,7 @@ class Trainer(object):
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
-            
+         
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -1249,7 +1331,7 @@ class Trainer(object):
                 self.local_step += 1
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                    preds, preds_depth, pred_ambient_aud, pred_ambient_eye, pred_uncertainty, truths, loss, loss_raw = self.eval_step(data)
                 
                 loss_val = loss.item()
                 total_loss += loss_val
@@ -1263,6 +1345,10 @@ class Trainer(object):
                     # save image
                     save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
                     save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
+                    # save_path_error = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_errormap.png')
+                    save_path_ambient_aud = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_aud.png')
+                    save_path_ambient_eye = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_eye.png')
+                    save_path_uncertainty = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_uncertainty.png')
                     #save_path_gt = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_gt.png')
 
                     #self.log(f"==> Saving validation image to {save_path}")
@@ -1273,10 +1359,27 @@ class Trainer(object):
 
                     pred = preds[0].detach().cpu().numpy()
                     pred_depth = preds_depth[0].detach().cpu().numpy()
-                    
+                    # loss_raw = loss_raw[0].mean(-1).detach().cpu().numpy()
+                    # loss_raw = (loss_raw - np.min(loss_raw)) / (np.max(loss_raw) - np.min(loss_raw))
+                    pred_ambient_aud = pred_ambient_aud[0].detach().cpu().numpy()
+                    pred_ambient_aud /= np.max(pred_ambient_aud)
+                    pred_ambient_eye = pred_ambient_eye[0].detach().cpu().numpy()
+                    pred_ambient_eye /= np.max(pred_ambient_eye)
+                    # pred_ambient = pred_ambient / 16
+                    # print(pred_ambient.shape)
+                    pred_uncertainty = pred_uncertainty[0].detach().cpu().numpy()
+                    # pred_uncertainty = (pred_uncertainty - np.min(pred_uncertainty)) / (np.max(pred_uncertainty) - np.min(pred_uncertainty))
+                    pred_uncertainty /= np.max(pred_uncertainty)
+
                     cv2.imwrite(save_path, cv2.cvtColor((pred * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(save_path_depth, (pred_depth * 255).astype(np.uint8))
-                    #cv2.imwrite(save_path_gt, cv2.cvtColor((linear_to_srgb(truths[0].detach().cpu().numpy()) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+                    if not self.opt.torso:
+                        cv2.imwrite(save_path_depth, (pred_depth * 255).astype(np.uint8))
+                        # cv2.imwrite(save_path_error, (loss_raw * 255).astype(np.uint8))
+                        cv2.imwrite(save_path_ambient_aud, (pred_ambient_aud * 255).astype(np.uint8))
+                        cv2.imwrite(save_path_ambient_eye, (pred_ambient_eye * 255).astype(np.uint8))
+                        cv2.imwrite(save_path_uncertainty, (pred_uncertainty * 255).astype(np.uint8))
+                        #cv2.imwrite(save_path_gt, cv2.cvtColor((linear_to_srgb(truths[0].detach().cpu().numpy()) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                     pbar.update(loader.batch_size)

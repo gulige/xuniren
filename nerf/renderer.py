@@ -50,7 +50,7 @@ def sample_pdf(bins, weights, n_samples, det=False):
 def plot_pointcloud(pc, color=None):
     # pc: [N, 3]
     # color: [N, 3/4]
-    #print('[visualize points]', pc.shape, pc.dtype, pc.min(0), pc.max(0))
+    print('[visualize points]', pc.shape, pc.dtype, pc.min(0), pc.max(0))
     pc = trimesh.PointCloud(pc, color)
     # axis
     axes = trimesh.creation.axis(axis_length=4)
@@ -210,17 +210,21 @@ class NeRFRenderer(nn.Module):
             self.local_step += 1
 
             xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
-            
-            sigmas, rgbs, ambient = self(xyzs, dirs, enc_a, ind_code, eye)
+            sigmas, rgbs, amb_aud, amb_eye, uncertainty = self(xyzs, dirs, enc_a, ind_code, eye)
             sigmas = self.density_scale * sigmas
 
             #print(f'valid RGB query ratio: {mask.sum().item() / mask.shape[0]} (total = {mask.sum().item()})')
 
-            weights_sum, ambient_sum, depth, image = raymarching.composite_rays_train(sigmas, rgbs, ambient.abs().sum(-1), deltas, rays)
+            # weights_sum, ambient_sum, uncertainty_sum, depth, image = raymarching.composite_rays_train_uncertainty(sigmas, rgbs, ambient.abs().sum(-1), uncertainty, deltas, rays)
+            weights_sum, amb_aud_sum, amb_eye_sum, uncertainty_sum, depth, image = raymarching.composite_rays_train_triplane(sigmas, rgbs, amb_aud.abs().sum(-1), amb_eye.abs().sum(-1), uncertainty, deltas, rays)
 
             # for training only
             results['weights_sum'] = weights_sum
-            results['ambient'] = ambient_sum
+            results['ambient_aud'] = amb_aud_sum
+            results['ambient_eye'] = amb_eye_sum
+            results['uncertainty'] = uncertainty_sum
+
+            results['rays'] = xyzs, dirs, enc_a, ind_code, eye
 
         else:
            
@@ -229,7 +233,10 @@ class NeRFRenderer(nn.Module):
             weights_sum = torch.zeros(N, dtype=dtype, device=device)
             depth = torch.zeros(N, dtype=dtype, device=device)
             image = torch.zeros(N, 3, dtype=dtype, device=device)
-            
+            amb_aud_sum = torch.zeros(N, dtype=dtype, device=device)
+            amb_eye_sum = torch.zeros(N, dtype=dtype, device=device)
+            uncertainty_sum = torch.zeros(N, dtype=dtype, device=device)
+
             n_alive = N
             rays_alive = torch.arange(n_alive, dtype=torch.int32, device=device) # [N]
             rays_t = nears.clone() # [N]
@@ -250,10 +257,11 @@ class NeRFRenderer(nn.Module):
 
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
 
-                sigmas, rgbs, ambient = self(xyzs, dirs, enc_a, ind_code, eye)
+                sigmas, rgbs, ambients_aud, ambients_eye, uncertainties = self(xyzs, dirs, enc_a, ind_code, eye)
                 sigmas = self.density_scale * sigmas
 
-                raymarching.composite_rays(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh)
+                # raymarching.composite_rays_uncertainty(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, ambients, uncertainties, weights_sum, depth, image, ambient_sum, uncertainty_sum, T_thresh)
+                raymarching.composite_rays_triplane(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, ambients_aud, ambients_eye, uncertainties, weights_sum, depth, image, amb_aud_sum, amb_eye_sum, uncertainty_sum, T_thresh)
 
                 rays_alive = rays_alive[rays_alive >= 0]
 
@@ -261,6 +269,42 @@ class NeRFRenderer(nn.Module):
 
                 step += n_step
             
+        torso_results = self.run_torso(rays_o, bg_coords, poses, index, bg_color)
+        bg_color = torso_results['bg_color']
+
+        image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+        image = image.view(*prefix, 3)
+        image = image.clamp(0, 1)
+
+        depth = torch.clamp(depth - nears, min=0) / (fars - nears)
+        depth = depth.view(*prefix)
+
+        amb_aud_sum = amb_aud_sum.view(*prefix)
+        amb_eye_sum = amb_eye_sum.view(*prefix)
+
+        results['depth'] = depth
+        results['image'] = image # head_image if train, else com_image
+        results['ambient_aud'] = amb_aud_sum
+        results['ambient_eye'] = amb_eye_sum
+        results['uncertainty'] = uncertainty_sum
+
+        return results
+    
+
+    def run_torso(self, rays_o, bg_coords, poses, index=0, bg_color=None, **kwargs):
+        # rays_o, rays_d: [B, N, 3], assumes B == 1
+        # auds: [B, 16]
+        # index: [B]
+        # return: image: [B, N, 3], depth: [B, N]
+
+        rays_o = rays_o.contiguous().view(-1, 3)
+        bg_coords = bg_coords.contiguous().view(-1, 2)
+
+        N = rays_o.shape[0] # N = B * N, in fact
+        device = rays_o.device
+
+        results = {}
+
         # background
         if bg_color is None:
             bg_color = 1
@@ -287,7 +331,7 @@ class NeRFRenderer(nn.Module):
             torso_color = torch.zeros([N, 3], device=device)
 
             if mask.any():
-                torso_alpha_mask, torso_color_mask, deform = self.forward_torso(bg_coords[mask], poses, enc_a, ind_code_torso)
+                torso_alpha_mask, torso_color_mask, deform = self.forward_torso(bg_coords[mask], poses, ind_code_torso)
 
                 torso_alpha[mask] = torso_alpha_mask.float()
                 torso_color[mask] = torso_color_mask.float()
@@ -302,18 +346,11 @@ class NeRFRenderer(nn.Module):
             results['torso_color'] = bg_color
 
             # print(torso_alpha.shape, torso_alpha.max().item(), torso_alpha.min().item())
-
-        image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
-        image = image.view(*prefix, 3)
-        image = image.clamp(0, 1)
-
-        depth = torch.clamp(depth - nears, min=0) / (fars - nears)
-        depth = depth.view(*prefix)
         
-        results['depth'] = depth
-        results['image'] = image # head_image if train, else com_image
-
+        results['bg_color'] = bg_color
+        
         return results
+
 
     @torch.no_grad()
     def mark_untrained_grid(self, poses, intrinsic, S=64):
@@ -453,7 +490,8 @@ class NeRFRenderer(nn.Module):
 
             # random pose, random ind_code
             rand_idx = random.randint(0, self.poses.shape[0] - 1)
-            pose = convert_poses(self.poses[[rand_idx]]).to(self.density_bitfield.device)
+            # pose = convert_poses(self.poses[[rand_idx]]).to(self.density_bitfield.device)
+            pose = self.poses[[rand_idx]].to(self.density_bitfield.device)
 
             if self.opt.ind_dim_torso > 0:
                 ind_code = self.individual_codes_torso[[rand_idx]]
@@ -475,7 +513,7 @@ class NeRFRenderer(nn.Module):
                     # add noise in [-hgs, hgs]
                     xys += (torch.rand_like(xys) * 2 - 1) * half_grid_size
                     # query density
-                    alphas, _, _ = self.forward_torso(xys, pose, enc_a, ind_code) # [N, 1]
+                    alphas, _, _ = self.forward_torso(xys, pose, ind_code) # [N, 1]
                     
                     # assign 
                     tmp_grid_torso[indices] = alphas.squeeze(1).float()
@@ -501,6 +539,121 @@ class NeRFRenderer(nn.Module):
         #print(f'[density grid] min={self.density_grid.min().item():.4f}, max={self.density_grid.max().item():.4f}, mean={self.mean_density:.4f}, occ_rate={(self.density_grid > 0.01).sum() / (128**3 * self.cascade):.3f} | [step counter] mean={self.mean_count}')
 
 
+    @torch.no_grad()
+    def get_audio_grid(self,  S=128):
+        # call before each epoch to update extra states.
+
+        if not self.cuda_ray:
+            return 
+        
+        # use random auds (different expressions should have similar density grid...)
+        rand_idx = random.randint(0, self.aud_features.shape[0] - 1)
+        auds = get_audio_features(self.aud_features, self.att, rand_idx).to(self.density_bitfield.device)
+
+        # encode audio
+        enc_a = self.encode_audio(auds)
+        tmp_grid = torch.zeros_like(self.density_grid)
+
+        # use a random eye area based on training dataset's statistics...
+        if self.exp_eye:
+            eye = self.eye_area[[rand_idx]].to(self.density_bitfield.device) # [1, 1]
+        else:
+            eye = None
+        
+        # full update
+        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+
+        for xs in X:
+            for ys in Y:
+                for zs in Z:
+                    
+                    # construct points
+                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
+                    coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3], in [0, 128)
+                    indices = raymarching.morton3D(coords).long() # [N]
+                    xyzs = 2 * coords.float() / (self.grid_size - 1) - 1 # [N, 3] in [-1, 1]
+
+                    # cascading
+                    for cas in range(self.cascade):
+                        bound = min(2 ** cas, self.bound)
+                        half_grid_size = bound / self.grid_size
+                        # scale to current cascade's resolution
+                        cas_xyzs = xyzs * (bound - half_grid_size)
+                        # add noise in [-hgs, hgs]
+                        cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
+                        # query density
+                        aud_norms = self.density(cas_xyzs.to(tmp_grid.dtype), enc_a, eye)['ambient_aud'].reshape(-1).detach().to(tmp_grid.dtype)
+                        # assign 
+                        tmp_grid[cas, indices] = aud_norms
+        
+        # dilate the density_grid (less aggressive culling)
+        tmp_grid = raymarching.morton3D_dilation(tmp_grid)
+        return tmp_grid
+        # # ema update
+        # valid_mask = (self.density_grid >= 0) & (tmp_grid >= 0)
+        # self.density_grid[valid_mask] = torch.maximum(self.density_grid[valid_mask] * decay, tmp_grid[valid_mask])
+
+
+    @torch.no_grad()
+    def get_eye_grid(self,  S=128):
+        # call before each epoch to update extra states.
+
+        if not self.cuda_ray:
+            return 
+        
+        # use random auds (different expressions should have similar density grid...)
+        rand_idx = random.randint(0, self.aud_features.shape[0] - 1)
+        auds = get_audio_features(self.aud_features, self.att, rand_idx).to(self.density_bitfield.device)
+
+        # encode audio
+        enc_a = self.encode_audio(auds)
+        tmp_grid = torch.zeros_like(self.density_grid)
+
+        # use a random eye area based on training dataset's statistics...
+        if self.exp_eye:
+            eye = self.eye_area[[rand_idx]].to(self.density_bitfield.device) # [1, 1]
+        else:
+            eye = None
+        
+        # full update
+        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+
+        for xs in X:
+            for ys in Y:
+                for zs in Z:
+                    
+                    # construct points
+                    xx, yy, zz = custom_meshgrid(xs, ys, zs)
+                    coords = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3], in [0, 128)
+                    indices = raymarching.morton3D(coords).long() # [N]
+                    xyzs = 2 * coords.float() / (self.grid_size - 1) - 1 # [N, 3] in [-1, 1]
+
+                    # cascading
+                    for cas in range(self.cascade):
+                        bound = min(2 ** cas, self.bound)
+                        half_grid_size = bound / self.grid_size
+                        # scale to current cascade's resolution
+                        cas_xyzs = xyzs * (bound - half_grid_size)
+                        # add noise in [-hgs, hgs]
+                        cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
+                        # query density
+                        eye_norms = self.density(cas_xyzs.to(tmp_grid.dtype), enc_a, eye)['ambient_eye'].reshape(-1).detach().to(tmp_grid.dtype)
+                        # assign 
+                        tmp_grid[cas, indices] = eye_norms
+        
+        # dilate the density_grid (less aggressive culling)
+        tmp_grid = raymarching.morton3D_dilation(tmp_grid)
+        return tmp_grid
+        # # ema update
+        # valid_mask = (self.density_grid >= 0) & (tmp_grid >= 0)
+        # self.density_grid[valid_mask] = torch.maximum(self.density_grid[valid_mask] * decay, tmp_grid[valid_mask])
+
+
+
     def render(self, rays_o, rays_d, auds, bg_coords, poses, staged=False, max_ray_batch=4096, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # auds: [B, 29, 16]
@@ -515,23 +668,33 @@ class NeRFRenderer(nn.Module):
 
         # never stage when cuda_ray
         if staged and not self.cuda_ray:
-            depth = torch.empty((B, N), device=device)
-            image = torch.empty((B, N, 3), device=device)
-
-            for b in range(B):
-                head = 0
-                while head < N:
-                    tail = min(head + max_ray_batch, N)
-                    results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], auds[b:b+1], bg_coords[:, head:tail], poses[b:b+1], **kwargs)
-                    depth[b:b+1, head:tail] = results_['depth']
-                    image[b:b+1, head:tail] = results_['image']
-                    head += max_ray_batch
-            
-            results = {}
-            results['depth'] = depth
-            results['image'] = image
+            # not used
+            raise NotImplementedError
 
         else:
             results = _run(rays_o, rays_d, auds, bg_coords, poses, **kwargs)
+
+        return results
+    
+    
+    def render_torso(self, rays_o, rays_d, auds, bg_coords, poses, staged=False, max_ray_batch=4096, **kwargs):
+        # rays_o, rays_d: [B, N, 3], assumes B == 1
+        # auds: [B, 29, 16]
+        # eye: [B, 1]
+        # bg_coords: [1, N, 2]
+        # return: pred_rgb: [B, N, 3]
+
+        _run = self.run_torso
+        
+        B, N = rays_o.shape[:2]
+        device = rays_o.device
+
+        # never stage when cuda_ray
+        if staged and not self.cuda_ray:
+            # not used
+            raise NotImplementedError
+
+        else:
+            results = _run(rays_o, bg_coords, poses, **kwargs)
 
         return results

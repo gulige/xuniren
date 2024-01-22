@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from encoding import get_encoder
-from activation import trunc_exp
 from .renderer import NeRFRenderer
 
 # Audio feature extractor
@@ -66,6 +65,7 @@ class AudioNet(nn.Module):
         x = self.encoder_fc1(x)
         return x
 
+
 class MLP(nn.Module):
     def __init__(self, dim_in, dim_out, dim_hidden, num_layers):
         super().__init__()
@@ -85,25 +85,15 @@ class MLP(nn.Module):
             x = self.net[l](x)
             if l != self.num_layers - 1:
                 x = F.relu(x, inplace=True)
+                # x = F.dropout(x, p=0.1, training=self.training)
+                
         return x
 
 
 class NeRFNetwork(NeRFRenderer):
     def __init__(self,
                  opt,
-                 # main network
-                 num_layers=3,
-                 hidden_dim=64,
-                 geo_feat_dim=64,
-                 num_layers_color=2,
-                 hidden_dim_color=64,
-                 # audio pre-encoder
-                 audio_dim=64,
-                 # deform_ambient net
-                 num_layers_ambient=3,
-                 hidden_dim_ambient=64,
-                 # ambient net
-                 ambient_dim=2,
+                 audio_dim = 32,
                  # torso net (hard coded for now)
                  ):
         super().__init__(opt)
@@ -115,6 +105,8 @@ class NeRFNetwork(NeRFRenderer):
             self.audio_in_dim = 44
         elif 'deepspeech' in self.opt.asr_model:
             self.audio_in_dim = 29
+        elif 'hubert' in self.opt.asr_model:
+            self.audio_in_dim = 1024
         else:
             self.audio_in_dim = 32
             
@@ -122,51 +114,111 @@ class NeRFNetwork(NeRFRenderer):
             self.embedding = nn.Embedding(self.audio_in_dim, self.audio_in_dim)
 
         # audio network
-        self.audio_dim = audio_dim    
+        self.audio_dim = audio_dim
         self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
 
         self.att = self.opt.att
         if self.att > 0:
             self.audio_att_net = AudioAttNet(self.audio_dim)
 
-        # ambient network
-        self.encoder, self.in_dim = get_encoder('tiledgrid', input_dim=3, num_levels=16, level_dim=2, base_resolution=16, log2_hashmap_size=16, desired_resolution=2048 * self.bound, interpolation='linear')
-        self.encoder_ambient, self.in_dim_ambient = get_encoder('tiledgrid', input_dim=ambient_dim, num_levels=16, level_dim=2, base_resolution=16, log2_hashmap_size=16, desired_resolution=2048, interpolation='linear')
+        # DYNAMIC PART
+        self.num_levels = 12
+        self.level_dim = 1
+        self.encoder_xy, self.in_dim_xy = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels, level_dim=self.level_dim, base_resolution=64, log2_hashmap_size=14, desired_resolution=512 * self.bound)
+        self.encoder_yz, self.in_dim_yz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels, level_dim=self.level_dim, base_resolution=64, log2_hashmap_size=14, desired_resolution=512 * self.bound)
+        self.encoder_xz, self.in_dim_xz = get_encoder('hashgrid', input_dim=2, num_levels=self.num_levels, level_dim=self.level_dim, base_resolution=64, log2_hashmap_size=14, desired_resolution=512 * self.bound)
 
-        self.num_layers_ambient = num_layers_ambient
-        self.hidden_dim_ambient = hidden_dim_ambient
-        self.ambient_dim = ambient_dim
+        self.in_dim = self.in_dim_xy + self.in_dim_yz + self.in_dim_xz
 
-        self.ambient_net = MLP(self.in_dim + self.audio_dim, self.ambient_dim, self.hidden_dim_ambient, self.num_layers_ambient)
-
-        # sigma network
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self.geo_feat_dim = geo_feat_dim
-
+        ## sigma network
+        self.num_layers = 3
+        self.hidden_dim = 64
+        self.geo_feat_dim = 64
+        self.eye_att_net = MLP(self.in_dim, 1, 16, 2)
         self.eye_dim = 1 if self.exp_eye else 0
-
-        self.sigma_net = MLP(self.in_dim + self.in_dim_ambient + self.eye_dim, 1 + self.geo_feat_dim, self.hidden_dim, self.num_layers)
-
-        # color network
-        self.num_layers_color = num_layers_color        
-        self.hidden_dim_color = hidden_dim_color
+        self.sigma_net = MLP(self.in_dim + self.audio_dim + self.eye_dim, 1 + self.geo_feat_dim, self.hidden_dim, self.num_layers)
+        ## color network
+        self.num_layers_color = 2
+        self.hidden_dim_color = 64
         self.encoder_dir, self.in_dim_dir = get_encoder('spherical_harmonics')
-        
         self.color_net = MLP(self.in_dim_dir + self.geo_feat_dim + self.individual_dim, 3, self.hidden_dim_color, self.num_layers_color)
+
+        self.unc_net = MLP(self.in_dim, 1, 32, 2)
+
+        self.aud_ch_att_net = MLP(self.in_dim, self.audio_dim, 64, 2)
+
+        self.testing = False
 
         if self.torso:
             # torso deform network
-            self.torso_deform_encoder, self.torso_deform_in_dim = get_encoder('frequency', input_dim=2, multires=10)
-            self.pose_encoder, self.pose_in_dim = get_encoder('frequency', input_dim=6, multires=4)
-            self.torso_deform_net = MLP(self.torso_deform_in_dim + self.pose_in_dim + self.individual_dim_torso, 2, 64, 3)
+            self.register_parameter('anchor_points', 
+                                    nn.Parameter(torch.tensor([[0.01, 0.01, 0.1, 1], [-0.1, -0.1, 0.1, 1], [0.1, -0.1, 0.1, 1]])))
+            self.torso_deform_encoder, self.torso_deform_in_dim = get_encoder('frequency', input_dim=2, multires=8)
+            # self.torso_deform_encoder, self.torso_deform_in_dim = get_encoder('tiledgrid', input_dim=2, num_levels=16, level_dim=1, base_resolution=16, log2_hashmap_size=16, desired_resolution=512)
+            self.anchor_encoder, self.anchor_in_dim = get_encoder('frequency', input_dim=6, multires=3)
+            self.torso_deform_net = MLP(self.torso_deform_in_dim + self.anchor_in_dim + self.individual_dim_torso, 2, 32, 3)
 
             # torso color network
-            self.torso_encoder, self.torso_in_dim = get_encoder('tiledgrid', input_dim=2, num_levels=16, level_dim=2, base_resolution=16, log2_hashmap_size=16, desired_resolution=2048, interpolation='linear')
-            # self.torso_net = MLP(self.torso_in_dim + self.torso_deform_in_dim + self.pose_in_dim + self.individual_dim_torso + self.audio_dim, 4, 64, 3)
-            self.torso_net = MLP(self.torso_in_dim + self.torso_deform_in_dim + self.pose_in_dim + self.individual_dim_torso, 4, 32, 3)
+            self.torso_encoder, self.torso_in_dim = get_encoder('tiledgrid', input_dim=2, num_levels=16, level_dim=2, base_resolution=16, log2_hashmap_size=16, desired_resolution=2048)
+            self.torso_net = MLP(self.torso_in_dim + self.torso_deform_in_dim + self.anchor_in_dim + self.individual_dim_torso, 4, 32, 3)
 
-       
+
+    def forward_torso(self, x, poses, c=None):
+        # x: [N, 2] in [-1, 1]
+        # head poses: [1, 4, 4]
+        # c: [1, ind_dim], individual code
+
+        # test: shrink x
+        x = x * self.opt.torso_shrink
+
+        # deformation-based
+        wrapped_anchor = self.anchor_points[None, ...] @ poses.permute(0, 2, 1).inverse()
+        wrapped_anchor = (wrapped_anchor[:, :, :2] / wrapped_anchor[:, :, 3, None] / wrapped_anchor[:, :, 2, None]).view(1, -1)
+        # print(wrapped_anchor)
+        # enc_pose = self.pose_encoder(poses)
+        enc_anchor = self.anchor_encoder(wrapped_anchor)
+        enc_x = self.torso_deform_encoder(x)
+
+        if c is not None:
+            h = torch.cat([enc_x, enc_anchor.repeat(x.shape[0], 1), c.repeat(x.shape[0], 1)], dim=-1)
+        else:
+            h = torch.cat([enc_x, enc_anchor.repeat(x.shape[0], 1)], dim=-1)
+
+        dx = self.torso_deform_net(h)
+        
+        x = (x + dx).clamp(-1, 1)
+
+        x = self.torso_encoder(x, bound=1)
+
+        # h = torch.cat([x, h, enc_a.repeat(x.shape[0], 1)], dim=-1)
+        h = torch.cat([x, h], dim=-1)
+
+        h = self.torso_net(h)
+
+        alpha = torch.sigmoid(h[..., :1])*(1 + 2*0.001) - 0.001
+        color = torch.sigmoid(h[..., 1:])*(1 + 2*0.001) - 0.001
+
+        return alpha, color, dx
+
+
+    @staticmethod
+    @torch.jit.script
+    def split_xyz(x):
+        xy, yz, xz = x[:, :-1], x[:, 1:], torch.cat([x[:,:1], x[:,-1:]], dim=-1)
+        return xy, yz, xz
+
+
+    def encode_x(self, xyz, bound):
+        # x: [N, 3], in [-bound, bound]
+        N, M = xyz.shape
+        xy, yz, xz = self.split_xyz(xyz)
+        feat_xy = self.encoder_xy(xy, bound=bound)
+        feat_yz = self.encoder_yz(yz, bound=bound)
+        feat_xz = self.encoder_xz(xz, bound=bound)
+        
+        return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
+    
+
     def encode_audio(self, a):
         # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
         # if emb, a should be: [1, 16] or [8, 16]
@@ -184,39 +236,14 @@ class NeRFNetwork(NeRFRenderer):
             
         return enc_a
 
-
-    def forward_torso(self, x, poses, enc_a, c=None):
-        # x: [N, 2] in [-1, 1]
-        # head poses: [1, 6]
-        # c: [1, ind_dim], individual code
-
-        # test: shrink x
-        x = x * self.opt.torso_shrink
-
-        # deformation-based 
-        enc_pose = self.pose_encoder(poses)
-        enc_x = self.torso_deform_encoder(x)
-
-        if c is not None:
-            h = torch.cat([enc_x, enc_pose.repeat(x.shape[0], 1), c.repeat(x.shape[0], 1)], dim=-1)
+    
+    def predict_uncertainty(self, unc_inp):
+        if self.testing or not self.opt.unc_loss:
+            unc = torch.zeros_like(unc_inp)
         else:
-            h = torch.cat([enc_x, enc_pose.repeat(x.shape[0], 1)], dim=-1)
+            unc = self.unc_net(unc_inp.detach())
 
-        dx = self.torso_deform_net(h)
-
-        x = (x + dx).clamp(-1, 1)
-
-        x = self.torso_encoder(x, bound=1)
-
-        # h = torch.cat([x, h, enc_a.repeat(x.shape[0], 1)], dim=-1)
-        h = torch.cat([x, h], dim=-1)
-
-        h = self.torso_net(h)
-
-        alpha = torch.sigmoid(h[..., :1])
-        color = torch.sigmoid(h[..., 1:])
-
-        return alpha, color, dx
+        return unc
 
 
     def forward(self, x, d, enc_a, c, e=None):
@@ -225,102 +252,59 @@ class NeRFNetwork(NeRFRenderer):
         # enc_a: [1, aud_dim]
         # c: [1, ind_dim], individual code
         # e: [1, 1], eye feature
+        enc_x = self.encode_x(x, bound=self.bound)
 
-        # starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        # starter.record()
-
-        if enc_a is None:
-            ambient = torch.zeros_like(x[:, :self.ambient_dim])
-            enc_x = self.encoder(x, bound=self.bound)
-            enc_w = self.encoder_ambient(ambient, bound=1)
-        else:
-            
-            enc_a = enc_a.repeat(x.shape[0], 1) 
-            enc_x = self.encoder(x, bound=self.bound)
-
-            # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"enocoder_deform = {curr_time}"); starter.record()
-
-            # ambient
-            ambient = torch.cat([enc_x, enc_a], dim=1)
-            ambient = self.ambient_net(ambient).float()
-            ambient = torch.tanh(ambient) # map to [-1, 1]
-
-            # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"de-an net = {curr_time}"); starter.record()
-
-            # sigma
-            enc_w = self.encoder_ambient(ambient, bound=1)
-
-        # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"encoder = {curr_time}"); starter.record()
-
-        if e is not None:
-            h = torch.cat([enc_x, enc_w, e.repeat(x.shape[0], 1)], dim=-1)
-        else:
-            h = torch.cat([enc_x, enc_w], dim=-1)
-
-        h = self.sigma_net(h)
-
-        # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"sigma_net = {curr_time}"); starter.record()
-        sigma = trunc_exp(h[..., 0])
-        geo_feat = h[..., 1:]
+        sigma_result = self.density(x, enc_a, e, enc_x)
+        sigma = sigma_result['sigma']
+        geo_feat = sigma_result['geo_feat']
+        aud_ch_att = sigma_result['ambient_aud']
+        eye_att = sigma_result['ambient_eye']
 
         # color
         enc_d = self.encoder_dir(d)
-
-        # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"encoder_dir = {curr_time}"); starter.record()
 
         if c is not None:
             h = torch.cat([enc_d, geo_feat, c.repeat(x.shape[0], 1)], dim=-1)
         else:
             h = torch.cat([enc_d, geo_feat], dim=-1)
+                
+        h_color = self.color_net(h)
+        color = torch.sigmoid(h_color)*(1 + 2*0.001) - 0.001
         
-        h = self.color_net(h)
-        # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"color_net = {curr_time}"); starter.record()
-        
-        # sigmoid activation for rgb
-        color = torch.sigmoid(h)
+        uncertainty = self.predict_uncertainty(enc_x)
+        uncertainty = torch.log(1 + torch.exp(uncertainty))
 
-        return sigma, color, ambient
+        return sigma, color, aud_ch_att, eye_att, uncertainty[..., None]
 
 
-    def density(self, x, enc_a, e=None):
+    def density(self, x, enc_a, e=None, enc_x=None):
         # x: [N, 3], in [-bound, bound]
+        if enc_x is None:
+            enc_x = self.encode_x(x, bound=self.bound)
 
-        if enc_a is None:
-            ambient = torch.zeros_like(x[:, :self.ambient_dim])
-            enc_x = self.encoder(x, bound=self.bound)
-            enc_w = self.encoder_ambient(ambient, bound=1)
-        else:
-
-            enc_a = enc_a.repeat(x.shape[0], 1) 
-            enc_x = self.encoder(x, bound=self.bound)
-
-            # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"enocoder_deform = {curr_time}"); starter.record()
-
-            # ambient
-            ambient = torch.cat([enc_x, enc_a], dim=1)
-            ambient = self.ambient_net(ambient).float()
-            ambient = torch.tanh(ambient) # map to [-1, 1]
-
-            # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"de-an net = {curr_time}"); starter.record()
-
-            # sigma
-            enc_w = self.encoder_ambient(ambient, bound=1)
-
-        # ender.record(); torch.cuda.synchronize(); curr_time = starter.elapsed_time(ender); print(f"encoder = {curr_time}"); starter.record()
+        enc_a = enc_a.repeat(enc_x.shape[0], 1)
+        aud_ch_att = self.aud_ch_att_net(enc_x)
+        enc_w = enc_a * aud_ch_att
 
         if e is not None:
-            h = torch.cat([enc_x, enc_w, e.repeat(x.shape[0], 1)], dim=-1)
+            # e = self.encoder_eye(e)
+            eye_att = torch.sigmoid(self.eye_att_net(enc_x))
+            e = e * eye_att
+            # e = e.repeat(enc_x.shape[0], 1)
+            h = torch.cat([enc_x, enc_w, e], dim=-1)
         else:
             h = torch.cat([enc_x, enc_w], dim=-1)
 
         h = self.sigma_net(h)
 
-        sigma = trunc_exp(h[..., 0])
+        sigma = torch.exp(h[..., 0])
         geo_feat = h[..., 1:]
 
         return {
             'sigma': sigma,
             'geo_feat': geo_feat,
+            'ambient_aud' : aud_ch_att.norm(dim=-1, keepdim=True),
+            'ambient_eye' : eye_att,
         }
 
 
@@ -331,8 +315,10 @@ class NeRFNetwork(NeRFRenderer):
         if self.torso:
             params = [
                 {'params': self.torso_encoder.parameters(), 'lr': lr},
+                {'params': self.torso_deform_encoder.parameters(), 'lr': lr, 'weight_decay': wd},
                 {'params': self.torso_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
                 {'params': self.torso_deform_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
+                {'params': self.anchor_points, 'lr': lr_net, 'weight_decay': wd}
             ]
 
             if self.individual_dim_torso > 0:
@@ -342,14 +328,17 @@ class NeRFNetwork(NeRFRenderer):
 
         params = [
             {'params': self.audio_net.parameters(), 'lr': lr_net, 'weight_decay': wd}, 
-            {'params': self.encoder.parameters(), 'lr': lr},
-            {'params': self.encoder_ambient.parameters(), 'lr': lr},
-            {'params': self.ambient_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
+
+            {'params': self.encoder_xy.parameters(), 'lr': lr},
+            {'params': self.encoder_yz.parameters(), 'lr': lr},
+            {'params': self.encoder_xz.parameters(), 'lr': lr},
+            # {'params': self.encoder_xyz.parameters(), 'lr': lr},
+
             {'params': self.sigma_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
             {'params': self.color_net.parameters(), 'lr': lr_net, 'weight_decay': wd}, 
         ]
         if self.att > 0:
-            params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': wd})
+            params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
         if self.emb:
             params.append({'params': self.embedding.parameters(), 'lr': lr})
         if self.individual_dim > 0:
@@ -357,5 +346,9 @@ class NeRFNetwork(NeRFRenderer):
         if self.train_camera:
             params.append({'params': self.camera_dT, 'lr': 1e-5, 'weight_decay': 0})
             params.append({'params': self.camera_dR, 'lr': 1e-5, 'weight_decay': 0})
+
+        params.append({'params': self.aud_ch_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
+        params.append({'params': self.unc_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
+        params.append({'params': self.eye_att_net.parameters(), 'lr': lr_net, 'weight_decay': wd})
 
         return params

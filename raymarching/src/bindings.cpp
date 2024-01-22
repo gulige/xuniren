@@ -18,4 +18,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // infer
     m.def("march_rays", &march_rays, "march rays (CUDA)");
     m.def("composite_rays", &composite_rays, "composite rays (CUDA)");
+    m.def("composite_rays_ambient", &composite_rays_ambient, "composite rays with ambient (CUDA)");
+
+    // train
+    m.def("composite_rays_train_sigma_forward", &composite_rays_train_sigma_forward, "composite_rays_train_forward (CUDA)");
+    m.def("composite_rays_train_sigma_backward", &composite_rays_train_sigma_backward, "composite_rays_train_backward (CUDA)");
+    // infer
+    m.def("composite_rays_ambient_sigma", &composite_rays_ambient_sigma, "composite rays with ambient (CUDA)");
+
+    // uncertainty train
+    m.def("composite_rays_train_uncertainty_forward", &composite_rays_train_uncertainty_forward, "composite_rays_train_forward (CUDA)");
+    m.def("composite_rays_train_uncertainty_backward", &composite_rays_train_uncertainty_backward, "composite_rays_train_backward (CUDA)");
+    m.def("composite_rays_uncertainty", &composite_rays_uncertainty, "composite rays with ambient (CUDA)");
+
+    // triplane
+    m.def("composite_rays_train_triplane_forward", &composite_rays_train_triplane_forward, "composite_rays_train_forward (CUDA)");
+    m.def("composite_rays_train_triplane_backward", &composite_rays_train_triplane_backward, "composite_rays_train_backward (CUDA)");
+    m.def("composite_rays_triplane", &composite_rays_triplane, "composite rays with ambient (CUDA)");
+
 }

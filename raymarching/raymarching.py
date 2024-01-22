@@ -421,3 +421,251 @@ class _composite_rays(Function):
 
 
 composite_rays = _composite_rays.apply
+
+
+class _composite_rays_ambient(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbs to float
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, ambients, weights_sum, depth, image, ambient_sum, T_thresh=1e-2):
+        _backend.composite_rays_ambient(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, ambients, weights_sum, depth, image, ambient_sum)
+        return tuple()
+
+
+composite_rays_ambient = _composite_rays_ambient.apply
+
+
+
+
+
+# custom
+
+class _composite_rays_train_sigma(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
+    def forward(ctx, sigmas, rgbs, ambient, deltas, rays, T_thresh=1e-4):
+        ''' composite rays' rgbs, according to the ray marching formula.
+        Args:
+            rgbs: float, [M, 3]
+            sigmas: float, [M,]
+            ambient: float, [M,] (after summing up the last dimension)
+            deltas: float, [M, 2]
+            rays: int32, [N, 3]
+        Returns:
+            weights_sum: float, [N,], the alpha channel
+            depth: float, [N, ], the Depth
+            image: float, [N, 3], the RGB channel (after multiplying alpha!)
+        '''
+        
+        sigmas = sigmas.contiguous()
+        rgbs = rgbs.contiguous()
+        ambient = ambient.contiguous()
+
+        M = sigmas.shape[0]
+        N = rays.shape[0]
+
+        weights_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        ambient_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        image = torch.empty(N, 3, dtype=sigmas.dtype, device=sigmas.device)
+
+        _backend.composite_rays_train_sigma_forward(sigmas, rgbs, ambient, deltas, rays, M, N, T_thresh, weights_sum, ambient_sum, depth, image)
+
+        ctx.save_for_backward(sigmas, rgbs, ambient, deltas, rays, weights_sum, ambient_sum, depth, image)
+        ctx.dims = [M, N, T_thresh]
+
+        return weights_sum, ambient_sum, depth, image
+    
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_weights_sum, grad_ambient_sum, grad_depth, grad_image):
+
+        # NOTE: grad_depth is not used now! It won't be propagated to sigmas.
+
+        grad_weights_sum = grad_weights_sum.contiguous()
+        grad_ambient_sum = grad_ambient_sum.contiguous()
+        grad_image = grad_image.contiguous()
+
+        sigmas, rgbs, ambient, deltas, rays, weights_sum, ambient_sum, depth, image = ctx.saved_tensors
+        M, N, T_thresh = ctx.dims
+   
+        grad_sigmas = torch.zeros_like(sigmas)
+        grad_rgbs = torch.zeros_like(rgbs)
+        grad_ambient = torch.zeros_like(ambient)
+
+        _backend.composite_rays_train_sigma_backward(grad_weights_sum, grad_ambient_sum, grad_image, sigmas, rgbs, ambient, deltas, rays, weights_sum, ambient_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs, grad_ambient)
+
+        return grad_sigmas, grad_rgbs, grad_ambient, None, None, None
+
+
+composite_rays_train_sigma = _composite_rays_train_sigma.apply
+
+
+class _composite_rays_ambient_sigma(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbs to float
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, ambients, weights_sum, depth, image, ambient_sum, T_thresh=1e-2):
+        _backend.composite_rays_ambient_sigma(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, ambients, weights_sum, depth, image, ambient_sum)
+        return tuple()
+
+
+composite_rays_ambient_sigma = _composite_rays_ambient_sigma.apply
+
+
+
+# uncertainty
+class _composite_rays_train_uncertainty(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
+    def forward(ctx, sigmas, rgbs, ambient, uncertainty, deltas, rays, T_thresh=1e-4):
+        ''' composite rays' rgbs, according to the ray marching formula.
+        Args:
+            rgbs: float, [M, 3]
+            sigmas: float, [M,]
+            ambient: float, [M,] (after summing up the last dimension)
+            deltas: float, [M, 2]
+            rays: int32, [N, 3]
+        Returns:
+            weights_sum: float, [N,], the alpha channel
+            depth: float, [N, ], the Depth
+            image: float, [N, 3], the RGB channel (after multiplying alpha!)
+        '''
+        
+        sigmas = sigmas.contiguous()
+        rgbs = rgbs.contiguous()
+        ambient = ambient.contiguous()
+        uncertainty = uncertainty.contiguous()
+
+        M = sigmas.shape[0]
+        N = rays.shape[0]
+
+        weights_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        ambient_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        uncertainty_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        image = torch.empty(N, 3, dtype=sigmas.dtype, device=sigmas.device)
+
+        _backend.composite_rays_train_uncertainty_forward(sigmas, rgbs, ambient, uncertainty, deltas, rays, M, N, T_thresh, weights_sum, ambient_sum, uncertainty_sum, depth, image)
+
+        ctx.save_for_backward(sigmas, rgbs, ambient, uncertainty, deltas, rays, weights_sum, ambient_sum, uncertainty_sum, depth, image)
+        ctx.dims = [M, N, T_thresh]
+
+        return weights_sum, ambient_sum, uncertainty_sum, depth, image
+    
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_weights_sum, grad_ambient_sum, grad_uncertainty_sum, grad_depth, grad_image):
+
+        # NOTE: grad_depth is not used now! It won't be propagated to sigmas.
+
+        grad_weights_sum = grad_weights_sum.contiguous()
+        grad_ambient_sum = grad_ambient_sum.contiguous()
+        grad_uncertainty_sum = grad_uncertainty_sum.contiguous()
+        grad_image = grad_image.contiguous()
+
+        sigmas, rgbs, ambient, uncertainty, deltas, rays, weights_sum, ambient_sum, uncertainty_sum, depth, image = ctx.saved_tensors
+        M, N, T_thresh = ctx.dims
+   
+        grad_sigmas = torch.zeros_like(sigmas)
+        grad_rgbs = torch.zeros_like(rgbs)
+        grad_ambient = torch.zeros_like(ambient)
+        grad_uncertainty = torch.zeros_like(uncertainty)
+
+        _backend.composite_rays_train_uncertainty_backward(grad_weights_sum, grad_ambient_sum, grad_uncertainty_sum, grad_image, sigmas, rgbs, ambient, uncertainty, deltas, rays, weights_sum, ambient_sum, uncertainty_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs, grad_ambient, grad_uncertainty)
+
+        return grad_sigmas, grad_rgbs, grad_ambient, grad_uncertainty, None, None, None
+
+
+composite_rays_train_uncertainty = _composite_rays_train_uncertainty.apply
+
+
+class _composite_rays_uncertainty(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbs to float
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, ambients, uncertainties, weights_sum, depth, image, ambient_sum, uncertainty_sum, T_thresh=1e-2):
+        _backend.composite_rays_uncertainty(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, ambients, uncertainties, weights_sum, depth, image, ambient_sum, uncertainty_sum)
+        return tuple()
+
+
+composite_rays_uncertainty = _composite_rays_uncertainty.apply
+
+
+
+# triplane(eye)
+class _composite_rays_train_triplane(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
+    def forward(ctx, sigmas, rgbs, amb_aud, amb_eye, uncertainty, deltas, rays, T_thresh=1e-4):
+        ''' composite rays' rgbs, according to the ray marching formula.
+        Args:
+            rgbs: float, [M, 3]
+            sigmas: float, [M,]
+            ambient: float, [M,] (after summing up the last dimension)
+            deltas: float, [M, 2]
+            rays: int32, [N, 3]
+        Returns:
+            weights_sum: float, [N,], the alpha channel
+            depth: float, [N, ], the Depth
+            image: float, [N, 3], the RGB channel (after multiplying alpha!)
+        '''
+        
+        sigmas = sigmas.contiguous()
+        rgbs = rgbs.contiguous()
+        amb_aud = amb_aud.contiguous()
+        amb_eye = amb_eye.contiguous()
+        uncertainty = uncertainty.contiguous()
+
+        M = sigmas.shape[0]
+        N = rays.shape[0]
+
+        weights_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        amb_aud_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        amb_eye_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        uncertainty_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        image = torch.empty(N, 3, dtype=sigmas.dtype, device=sigmas.device)
+
+        _backend.composite_rays_train_triplane_forward(sigmas, rgbs, amb_aud, amb_eye, uncertainty, deltas, rays, M, N, T_thresh, weights_sum, amb_aud_sum, amb_eye_sum, uncertainty_sum, depth, image)
+
+        ctx.save_for_backward(sigmas, rgbs, amb_aud, amb_eye, uncertainty, deltas, rays, weights_sum, amb_aud_sum, amb_eye_sum, uncertainty_sum, depth, image)
+        ctx.dims = [M, N, T_thresh]
+
+        return weights_sum, amb_aud_sum, amb_eye_sum, uncertainty_sum, depth, image
+    
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_weights_sum, grad_amb_aud_sum, grad_amb_eye_sum, grad_uncertainty_sum, grad_depth, grad_image):
+
+        # NOTE: grad_depth is not used now! It won't be propagated to sigmas.
+
+        grad_weights_sum = grad_weights_sum.contiguous()
+        grad_amb_aud_sum = grad_amb_aud_sum.contiguous()
+        grad_amb_eye_sum = grad_amb_eye_sum.contiguous()
+        grad_uncertainty_sum = grad_uncertainty_sum.contiguous()
+        grad_image = grad_image.contiguous()
+
+        sigmas, rgbs, amb_aud, amb_eye, uncertainty, deltas, rays, weights_sum, amb_aud_sum, amb_eye_sum, uncertainty_sum, depth, image = ctx.saved_tensors
+        M, N, T_thresh = ctx.dims
+   
+        grad_sigmas = torch.zeros_like(sigmas)
+        grad_rgbs = torch.zeros_like(rgbs)
+        grad_amb_aud = torch.zeros_like(amb_aud)
+        grad_amb_eye = torch.zeros_like(amb_eye)
+        grad_uncertainty = torch.zeros_like(uncertainty)
+
+        _backend.composite_rays_train_triplane_backward(grad_weights_sum, grad_amb_aud_sum, grad_amb_eye_sum, grad_uncertainty_sum, grad_image, sigmas, rgbs, amb_aud, amb_eye, uncertainty, deltas, rays, weights_sum, amb_aud_sum, amb_eye_sum, uncertainty_sum, image, M, N, T_thresh, grad_sigmas, grad_rgbs, grad_amb_aud, grad_amb_eye, grad_uncertainty)
+
+        return grad_sigmas, grad_rgbs, grad_amb_aud, grad_amb_eye, grad_uncertainty, None, None, None
+
+
+composite_rays_train_triplane = _composite_rays_train_triplane.apply
+
+
+class _composite_rays_triplane(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbs to float
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, ambs_aud, ambs_eye, uncertainties, weights_sum, depth, image, amb_aud_sum, amb_eye_sum, uncertainty_sum, T_thresh=1e-2):
+        _backend.composite_rays_triplane(n_alive, n_step, T_thresh, rays_alive, rays_t, sigmas, rgbs, deltas, ambs_aud, ambs_eye, uncertainties, weights_sum, depth, image, amb_aud_sum, amb_eye_sum, uncertainty_sum)
+        return tuple()
+
+
+composite_rays_triplane = _composite_rays_triplane.apply
