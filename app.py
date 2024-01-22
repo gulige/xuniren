@@ -15,6 +15,7 @@ import numpy as np
 import shutil
 import asyncio
 import edge_tts
+import video_stream
 app = Flask(__name__)
 sockets = Sockets(app)
 video_list = []
@@ -91,6 +92,7 @@ if __name__ == '__main__':
 
     audio_pre_process()
     video_pre_process()
+    video_stream.start()
     
     server = pywsgi.WSGIServer(('127.0.0.1', 8800), app, handler_class=WebSocketHandler)
     server.serve_forever()
